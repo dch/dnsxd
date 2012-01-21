@@ -47,7 +47,8 @@
 		expire :: pos_integer(),
 		ttl :: non_neg_integer(),
 		data = [] :: [tuple()],
-		sig = [] :: [tuple()]}).
+		sig = [] :: [tuple()],
+		add_dnames = [] :: [binary()]}).
 -record(tsig, {zone_ref :: #zone_ref{}, keys = [] :: [tuple()]}).
 -record(zone, {labels :: [binary()],
 	       name :: binary(),

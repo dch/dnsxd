@@ -178,7 +178,7 @@ to_rr(Now, DNSSEC, RRs) when is_list(RRs) ->
 to_rr(Now, false, #rrset{name = Name, class = Class, type = Type,
 			 data = Datas} = Set, Acc) ->
     TTL = ttl(Now, Set),
-    lists:foldr(fun(Data, Acc0) ->
+    lists:foldl(fun(Data, Acc0) ->
 			[#dns_rr{name = Name,
 				 class = Class,
 				 type = Type,
@@ -187,7 +187,7 @@ to_rr(Now, false, #rrset{name = Name, class = Class, type = Type,
 		end, Acc, Datas);
 to_rr(Now, true, #rrset{name = Name, class = Class, sig = Sigs} = Set, Acc) ->
     TTL = ttl(Now, Set),
-    Acc1 = lists:foldr(fun(Sig, Acc0) ->
+    Acc1 = lists:foldl(fun(Sig, Acc0) ->
 			       [#dns_rr{name = Name,
 					class = Class,
 					type = ?DNS_TYPE_RRSIG,
@@ -216,13 +216,17 @@ ttl(Now, Incept, Expire, NaturalTTL) ->
 	false -> NaturalTTL
     end.
 
-build_optrr(MsgCtx, #dns_optrr{}, Props) ->
+build_optrr(MsgCtx, #dns_optrr{data = ReqDatas}, Props) ->
     PayloadSize = dnsxd_op_ctx:max_size(MsgCtx),
     DNSSEC = proplists:get_bool(dnssec, Props),
-    Datas = [ EOpt || EOpt <- Props, is_eopt(EOpt) ],
-    #dns_optrr{udp_payload_size = PayloadSize,
-	       dnssec = DNSSEC,
-	       data = Datas}.
+    Props0 = case lists:keymember(dns_opt_nsid, 1, ReqDatas) of
+		 true ->
+		     {ok, Host} = inet:gethostname(),
+		     [#dns_opt_nsid{data = list_to_binary(Host)}|Props];
+		 false -> Props
+	     end,
+    Datas = [ EOpt || EOpt <- Props0, is_eopt(EOpt) ],
+    #dns_optrr{udp_payload_size = PayloadSize, dnssec = DNSSEC, data = Datas}.
 
 is_eopt(#dns_opt_llq{}) -> true;
 is_eopt(#dns_opt_ul{}) -> true;

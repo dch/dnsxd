@@ -38,9 +38,9 @@ prepare(TempTab, Ref, #dnsxd_zone{} = Zone) ->
 
 receive_result(Pid, Ref) ->
     receive
-	{Pid, Ref, Serials, AXFR} ->
+	{Pid, Ref, Serials, SOA, NSEC3, AXFR} ->
 	    receive
-		{'EXIT', Pid, 'normal'} -> {ok, Serials, AXFR};
+		{'EXIT', Pid, 'normal'} -> {ok, Serials, SOA, NSEC3, AXFR};
 		{'EXIT', Pid, Reason} -> {error, Reason}
 	    end;
 	{'EXIT', Pid, Reason} -> {error, Reason}
@@ -54,14 +54,15 @@ main(Parent, TempTab, Ref, #dnsxd_zone{name = ZoneName} = Zone) ->
 	     fun prep_dnsseckey/1,
 	     fun prep_serials/1 ],
     Zone0 = lists:foldl(fun(Fun, #dnsxd_zone{} = T) -> Fun(T) end, Zone, Funs),
+    #dnsxd_zone{soa_param = SOA, nsec3 = NSEC3, tsig_keys = TSIGKeys} = Zone0,
     ZoneRef = #zone_ref{name = ZoneName, ref = Ref},
-    TSIG = #tsig{zone_ref = ZoneRef, keys = Zone0#dnsxd_zone.tsig_keys},
+    TSIG = #tsig{zone_ref = ZoneRef, keys = TSIGKeys},
     ets:insert(TempTab, TSIG),
     Serials = get_serials_to_prep(Zone0),
     AXFR = axfr_settings(Zone0),
     ok = main(TempTab, [], WorkerLimit, Serials, Ref, Zone0),
     RealSerials = lists:reverse(tl(lists:reverse(Serials))),
-    Parent ! {self(), Ref, RealSerials, AXFR}.
+    Parent ! {self(), Ref, RealSerials, SOA, NSEC3, AXFR}.
 
 main(TempTab, Workers, Limit, [Serial|[NextSerial|_] = Serials], Ref, Zone)
   when length(Workers) < Limit ->
@@ -479,11 +480,13 @@ gen_nsec3(#dnsxd_zone{name = ZoneName,
 		  Types0 = if Types =:= [] -> [];
 			      true -> lists:usort([?DNS_TYPE_RRSIG|Types]) end,
 		  CutBy = case Sets of
-			      [#rrset{cutby = CutByTmp}|_] -> CutByTmp;
-			      _ -> undefined
+			      [] -> undefined;
+			      [#rrset{cutby = CutByTmp}|_] -> CutByTmp
 			  end,
 		  NotCut = CutBy =:= undefined,
 		  DSExists = lists:member(?DNS_TYPE_DS, Types),
+		  NSExists = lists:member(?DNS_TYPE_NS, Types),
+		  OptOut = NSExists andalso not DSExists,
 		  case NotCut orelse DSExists of
 		      true ->
 			  DName = dns:encode_dname(Name),
@@ -492,7 +495,7 @@ gen_nsec3(#dnsxd_zone{name = ZoneName,
 			  NewName = <<HashedDNHex/binary, $.,
 				      ZoneName/binary>>,
 			  Data = #dns_rrdata_nsec3{hash_alg = 1,
-						   opt_out = false,
+						   opt_out = OptOut,
 						   iterations = Iter,
 						   salt = Salt,
 						   hash = HashedDNHex,
@@ -582,7 +585,7 @@ gen_rrname_recs(Name, Sets, Acc, Context) ->
 		 end,
     Cuts = orddict:fetch(cuts, Context),
     RRNameRef = #rrname_ref{serial_ref = SerialRef, name = Name},
-    Types = [ Type || #rrset{type = Type} <- Sets ],
+    Types = lists:reverse(lists:sort([ Type || #rrset{type = Type} <- Sets ])),
     CoveredBy = case lists:keyfind(Name, #nsec3.name, NSEC3Names) of
 		    #nsec3{hashdn = HashDN} -> HashDN;
 		    false -> undefined
@@ -613,8 +616,28 @@ gen_set_rec(#rrset{type = Type, incept = Incept, expire = Expire,
 	      true -> [] end,
     BinSigs = encode_rrdatas(Sigs),
     BinDatas = encode_rrdatas(Datas),
+    AddDnames = collect_add_dnames(Datas),
     SetRef = #rrset_ref{rrname_ref = NameRef, type = Type},
-    Set#rrset{ref = SetRef, sig = BinSigs, data = BinDatas}.
+    Set#rrset{ref = SetRef, sig = BinSigs, data = BinDatas,
+	      add_dnames = AddDnames}.
+
+collect_add_dnames(Datas) -> collect_add_dnames(Datas, dict:new()).
+
+collect_add_dnames([Data|Datas], Dict) ->
+    Dict0 = case collect_add_dname(Data) of
+		undefined -> Dict;
+		Name -> dict:store(dns:dname_to_lower(Name), Name, Dict)
+	    end,
+    collect_add_dnames(Datas, Dict0);
+collect_add_dnames([], Dict) ->
+    lists:sort(dict:fold(fun(_Key, Value, Acc) -> [Value|Acc] end, [], Dict)).
+
+collect_add_dname(#dns_rrdata_cname{dname = Name}) -> Name;
+collect_add_dname(#dns_rrdata_mx{exchange = Name}) -> Name;
+collect_add_dname(#dns_rrdata_ns{dname = Name}) -> Name;
+collect_add_dname(#dns_rrdata_ptr{dname = Name}) -> Name;
+collect_add_dname(#dns_rrdata_srv{target = Name}) -> Name;
+collect_add_dname(_) -> undefined.
 
 sign_rr(UseKSK, ZoneName, DNSSECKeys, Incept, Expire, Name, Type, Datas) ->
     DNSSECKeys0 = [ Key || #dnsxd_dnssec_key{incept = KeyIncept,

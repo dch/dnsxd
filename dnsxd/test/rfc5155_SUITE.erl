@@ -1,0 +1,268 @@
+-module(rfc5155_SUITE).
+-include("dnsxd_ct.hrl").
+
+-export([all/0, init_per_testcase/2, end_per_testcase/2]).
+
+-export([name_error/1, no_data/1, no_data_empty_nonterminal/1, referral_1/1,
+	 referral_2/1, wildcard_expansion/1, wildcard_no_data/1,
+	 ds_child_zone_no_data_error/1]).
+
+all() -> ?arity1_exports.
+
+rr(Config) ->
+    RR = [#dnsxd_rr{data = #dns_rrdata_ns{dname = <<"ns1.example">>}},
+	  #dnsxd_rr{data = #dns_rrdata_ns{dname = <<"ns2.example">>}},
+	  #dnsxd_rr{data = #dns_rrdata_mx{preference = 1,
+					  exchange = <<"xx.example">>}},
+	  #dnsxd_rr{name = <<"a.example">>,
+		    data = #dns_rrdata_ns{dname = <<"ns1.example">>}},
+	   #dnsxd_rr{name = <<"a.example">>,
+		     data = #dns_rrdata_ns{dname = <<"ns2.example">>}},
+	  #dnsxd_rr{name = <<"a.example">>,
+		    data = #dns_rrdata_ds{
+		      keytag = 58470,
+		      alg = 1,
+		      digest_type = 1,
+		      digest = <<48,121,241,89,62,186,214,220,18,30,32,42,139,118,106,106,72,55,32,108>>
+		      }},
+	  #dnsxd_rr{name = <<"ns1.a.example">>,
+		    data = #dns_rrdata_a{ip = <<"192.0.2.5">>}},
+	  #dnsxd_rr{name = <<"ns2.a.example">>,
+		    data = #dns_rrdata_a{ip = <<"192.0.2.6">>}},
+	  #dnsxd_rr{name = <<"ai.example">>,
+		     data = #dns_rrdata_a{ip = <<"192.0.2.9">>}},
+	  #dnsxd_rr{name = <<"ai.example">>,
+		    data = #dns_rrdata_hinfo{cpu = <<"KLH-10">>,
+					     os = <<"ITS">>}},
+	  #dnsxd_rr{name = <<"ai.example">>,
+		    data = #dns_rrdata_aaaa{
+		      ip = <<"2001:db8:0:0:0:0:f00:baa9">>}},
+	   #dnsxd_rr{name = <<"c.example">>,
+		     data = #dns_rrdata_ns{dname = <<"ns1.c.example">>}},
+	  #dnsxd_rr{name = <<"c.example">>,
+		    data = #dns_rrdata_ns{dname = <<"ns2.c.example">>}},
+	  #dnsxd_rr{name = <<"ns1.c.example">>,
+		    data = #dns_rrdata_a{ip = <<"192.0.2.7">>}},
+	  #dnsxd_rr{name = <<"ns2.c.example">>,
+		    data = #dns_rrdata_a{ip = <<"192.0.2.8">>}},
+	  #dnsxd_rr{name = <<"ns1.example">>,
+		    data = #dns_rrdata_a{ip = <<"192.0.2.1">>}},
+	  #dnsxd_rr{name = <<"ns2.example">>,
+		     data = #dns_rrdata_a{ip = <<"192.0.2.2">>}},
+	  #dnsxd_rr{name = <<"*.w.example">>,
+		    data = #dns_rrdata_mx{preference = 1,
+					  exchange = <<"ai.example">>}},
+	  #dnsxd_rr{name = <<"x.w.example">>,
+		    data = #dns_rrdata_mx{preference = 1,
+					  exchange = <<"xx.example">>}},
+	  #dnsxd_rr{name = <<"x.y.w.example">>,
+		    data = #dns_rrdata_mx{preference = 1,
+					  exchange = <<"xx.example">>}},
+	  #dnsxd_rr{name = <<"xx.example">>,
+		    data = #dns_rrdata_a{ip = <<"192.0.2.10">>}},
+	  #dnsxd_rr{name = <<"xx.example">>,
+		    data = #dns_rrdata_hinfo{cpu = <<"KLH-10">>,
+					     os = <<"TOPS-20">>}},
+	  #dnsxd_rr{name = <<"xx.example">>,
+		    data = #dns_rrdata_aaaa{
+		      ip = <<"2001:db8:0:0:0:0:f00:baaa">>}}],
+    [{rr, RR}|Config].
+
+init_per_testcase(_TestCase, Config) ->
+    ?testcase_init(rr([{dnssec, true}|Config])).
+
+end_per_testcase(_TestCase, Config) -> ok = ?testcase_end(Config).
+
+name_error(Config) ->
+    Query = #dns_query{name = <<"a.c.x.w.example">>, type = ?DNS_TYPE_SOA},
+    QMsg = #dns_message{qc = 1, adc = 1, questions = [Query],
+			additional = [#dns_optrr{dnssec = true}]},
+    SOA = ?gen_ms_rr(<<"example">>, [?DNS_TYPE_SOA, ?DNS_TYPE_RRSIG]),
+    NSEC3 = ?gen_ms_rr([<<"0p9mhaveqvm6t7vbl5lop2u3t2rp3tom.example">>,
+				<<"b4um86eghhds6nea196smvmlo4ors995.example">>,
+				<<"35mthgpgcu1qg68fab165klnsnk3dpvl.example">>],
+			       [?DNS_TYPE_NSEC3, ?DNS_TYPE_RRSIG]),
+    Authority = SOA ++ NSEC3,
+    RMsg = #dns_message{
+      id = QMsg#dns_message.id,
+      qr = true,
+      aa = true,
+      qc = 1,
+      anc = 0,
+      auc = 8,
+      adc = 1,
+      questions = [Query],
+      answers = [],
+      authority = Authority,
+      additional = [#dns_optrr{dnssec = true, _ = '_'}],
+      _ = '_'},
+    ?match_response(Config, QMsg, RMsg).
+
+no_data(Config) ->
+    Query = #dns_query{name = <<"ns1.example">>, type = ?DNS_TYPE_MX},
+    QMsg = #dns_message{qc = 1, adc = 1, questions = [Query],
+			additional = [#dns_optrr{dnssec = true}]},
+    SOA = ?gen_ms_rr(<<"example">>, [?DNS_TYPE_SOA, ?DNS_TYPE_RRSIG]),
+    NSEC3 = ?gen_ms_rr(<<"2t7b4g4vsa5smi47k61mv5bv1a22bojr.example">>,
+			       [?DNS_TYPE_NSEC3, ?DNS_TYPE_RRSIG]),
+    Authority = SOA ++ NSEC3,
+    RMsg = #dns_message{
+      id = QMsg#dns_message.id, qc = 1, anc = 0, auc = 4, adc = 1,
+      qr = true,
+      aa = true,
+      questions = [Query],
+      answers = [],
+      authority = Authority,
+      additional = [#dns_optrr{dnssec = true, _ = '_'}],
+      _ = '_'},
+    ?match_response(Config, QMsg, RMsg).
+
+no_data_empty_nonterminal(Config) ->
+    Query = #dns_query{name = <<"y.w.example">>, type = ?DNS_TYPE_A},
+    QMsg = #dns_message{qc = 1, adc = 1, questions = [Query],
+			additional = [#dns_optrr{dnssec = true}]},
+    SOA = ?gen_ms_rr(<<"example">>, [?DNS_TYPE_SOA, ?DNS_TYPE_RRSIG]),
+    NSEC3 = ?gen_ms_rr(<<"ji6neoaepv8b5o6k4ev33abha8ht9fgc.example">>,
+			       [?DNS_TYPE_NSEC3, ?DNS_TYPE_RRSIG]),
+    Authority = SOA ++ NSEC3,
+    RMsg = #dns_message{
+      id = QMsg#dns_message.id,
+      qr = true,
+      qc = 1,
+      anc = 0,
+      auc = 4,
+      adc = 1,
+      questions = [Query],
+      answers = [],
+      authority = Authority,
+      additional = [#dns_optrr{dnssec = true, _ = '_'}],
+      _ = '_'},
+    ?match_response(Config, QMsg, RMsg).
+
+referral_1(Config) ->
+    Query = #dns_query{name = <<"c.example">>, type = ?DNS_TYPE_NS},
+    QMsg = #dns_message{qc = 1, adc = 1, questions = [Query],
+			additional = [#dns_optrr{dnssec = true}]},
+    NS = ?gen_ms_rr(<<"c.example">>, [?DNS_TYPE_NS, ?DNS_TYPE_NS]),
+    NSEC3 = ?gen_ms_rr(<<"35mthgpgcu1qg68fab165klnsnk3dpvl.example">>,
+			       [?DNS_TYPE_NSEC3, ?DNS_TYPE_RRSIG]),
+    Authority = NS ++ NSEC3,
+    RMsg = #dns_message{
+      id = QMsg#dns_message.id,
+      qr = true,
+      aa = false,
+      qc = 1,
+      anc = 0,
+      auc = 4,
+      adc = 3,
+      questions = [Query],
+      answers = [],
+      authority = Authority,
+      additional = [#dns_optrr{dnssec = true, _ = '_'},
+		    #dns_rr{name = <<"ns1.c.example">>, _ = '_'},
+		    #dns_rr{name = <<"ns2.c.example">>, _ = '_'}],
+      _ = '_'},
+    ?match_response(Config, QMsg, RMsg).
+
+referral_2(Config) ->
+    Query = #dns_query{name = <<"mc.c.example">>, type = ?DNS_TYPE_NS},
+    QMsg = #dns_message{qc = 1, adc = 1, questions = [Query],
+			additional = [#dns_optrr{dnssec = true}]},
+    NS = ?gen_ms_rr(<<"c.example">>, [?DNS_TYPE_NS, ?DNS_TYPE_NS]),
+    NSEC3 = ?gen_ms_rr([<<"35mthgpgcu1qg68fab165klnsnk3dpvl.example">>,
+				<<"0p9mhaveqvm6t7vbl5lop2u3t2rp3tom.example">>],
+			       [?DNS_TYPE_NSEC3, ?DNS_TYPE_RRSIG]),
+    Authority = NS ++ NSEC3,
+    RMsg = #dns_message{
+      id = QMsg#dns_message.id,
+      qr = true,
+      aa = false,
+      qc = 1,
+      anc = 0,
+      auc = 6,
+      adc = 3,
+      questions = [Query],
+      answers = [],
+      authority = Authority,
+      additional = [#dns_optrr{dnssec = true, _ = '_'},
+		    #dns_rr{name = <<"ns1.c.example">>, _ = '_'},
+		    #dns_rr{name = <<"ns2.c.example">>, _ = '_'}],
+      _ = '_'},
+    ?match_response(Config, QMsg, RMsg).
+
+wildcard_expansion(Config) ->
+    Query = #dns_query{name = <<"a.z.w.example">>, type = ?DNS_TYPE_MX},
+    QMsg = #dns_message{qc = 1, adc = 1, questions = [Query],
+			additional = [#dns_optrr{dnssec = true}]},
+    ANS = ?gen_ms_rr(<<"a.z.w.example">>,
+			     [?DNS_TYPE_MX, ?DNS_TYPE_RRSIG]),
+    NS = ?gen_ms_rr(<<"example">>,
+			    [?DNS_TYPE_NS, ?DNS_TYPE_NS, ?DNS_TYPE_RRSIG]),
+    NSEC3 = ?gen_ms_rr(<<"q04jkcevqvmu85r014c7dkba38o0ji5r.example">>,
+			       [?DNS_TYPE_NSEC3, ?DNS_TYPE_RRSIG]),
+    Authority = NS ++ NSEC3,
+    Hosts = ?gen_ms_rr(<<"ai.example">>,
+			       [?DNS_TYPE_A, ?DNS_TYPE_RRSIG, ?DNS_TYPE_AAAA,
+				?DNS_TYPE_RRSIG]),
+    RMsg = #dns_message{
+      id = QMsg#dns_message.id,
+      qr = true,
+      aa = true,
+      qc = 1,
+      anc = 2,
+      auc = 5,
+      adc = 5,
+      questions = [Query],
+      answers = ANS,
+      authority = Authority,
+      additional = [#dns_optrr{dnssec = true, _ = '_'}|Hosts],
+      _ = '_'},
+    ?match_response(Config, QMsg, RMsg).
+
+wildcard_no_data(Config) ->
+    Query = #dns_query{name = <<"a.z.w.example">>, type = ?DNS_TYPE_AAAA},
+    QMsg = #dns_message{qc = 1, adc = 1, questions = [Query],
+			additional = [#dns_optrr{dnssec = true}]},
+    SOA = ?gen_ms_rr(<<"example">>, [?DNS_TYPE_SOA, ?DNS_TYPE_RRSIG]),
+    NSEC3 = ?gen_ms_rr([<<"k8udemvp1j2f7eg6jebps17vp3n8i58h.example">>,
+				<<"q04jkcevqvmu85r014c7dkba38o0ji5r.example">>,
+				<<"r53bq7cc2uvmubfu5ocmm6pers9tk9en.example">>],
+			       [?DNS_TYPE_NSEC3, ?DNS_TYPE_RRSIG]),
+    Authority = SOA ++ NSEC3,
+    RMsg = #dns_message{
+      id = QMsg#dns_message.id,
+      qr = true,
+      aa = true,
+      qc = 1,
+      anc = 0,
+      auc = 8,
+      adc = 1,
+      questions = [Query],
+      answers = [],
+      authority = Authority,
+      additional = [#dns_optrr{dnssec = true, _ = '_'}],
+      _ = '_'},
+    ?match_response(Config, QMsg, RMsg).
+
+ds_child_zone_no_data_error(Config) ->
+    Query = #dns_query{name = <<"example">>, type = ?DNS_TYPE_DS},
+    QMsg = #dns_message{qc = 1, adc = 1, questions = [Query],
+			additional = [#dns_optrr{dnssec = true}]},
+    SOA = ?gen_ms_rr(<<"example">>, [?DNS_TYPE_SOA, ?DNS_TYPE_RRSIG]),
+    NSEC3 = ?gen_ms_rr(<<"0p9mhaveqvm6t7vbl5lop2u3t2rp3tom.example">>,
+			       [?DNS_TYPE_NSEC3, ?DNS_TYPE_RRSIG]),
+    Authority = SOA ++ NSEC3,
+    RMsg = #dns_message{
+      id = QMsg#dns_message.id,
+      qr = true,
+      aa = true,
+      qc = 1,
+      anc = 0,
+      auc = 4,
+      adc = 1,
+      questions = [Query],
+      answers = [],
+      authority = Authority,
+      additional = [#dns_optrr{dnssec = true, _ = '_'}],
+      _ = '_'},
+    ?match_response(Config, QMsg, RMsg).

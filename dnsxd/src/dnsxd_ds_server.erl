@@ -51,10 +51,9 @@
 -export([load_zone/1, reload_zone/1, delete_zone/1, zone_loaded/1]).
 
 %% querying
--export([zone_ref_for_name/1, is_dnssec_zone/1, axfr_hosts/1, lookup_rrname/2,
-	 is_cut/2, lookup_set/3, lookup_set/4, lookup_sets/3, get_set/3,
-	 get_set_list/1, get_cutters_set/2, get_key/1, zonename_from_ref/1,
-	 get_nsec3_cover/2, get_zone/1, next_serial/1]).
+-export([find_zone/1, is_dnssec_zone/1, axfr_hosts/1, lookup_rrname/2,
+	 is_cut/2, lookup_sets/4, get_set/3, get_all_sets/1, get_key/1,
+	 zonename_from_ref/1, get_nsec3_cover/2, get_zone/1, next_serial/1]).
 
 %%%===================================================================
 %%% API
@@ -80,7 +79,7 @@ next_serial(ZoneName) when is_binary(ZoneName) ->
 	_ -> undefined
     end.
 
-zone_ref_for_name(Name) when is_binary(Name) ->
+find_zone(Name) when is_binary(Name) ->
     case zone_for_name(Name) of
 	#zone{} = Ref -> get_current_serial_ref(Ref);
 	undefined -> undefined
@@ -147,22 +146,22 @@ get_nsec3_cover(#serial_ref{zone_ref = ZoneRef} = SerialRef, Name) ->
     case lists:keyfind(Name, #nsec3.name, NSEC3) of
 	#nsec3{hashdn = HashedName} ->
 	    RRNameRef = #rrname_ref{serial_ref = SerialRef, name = HashedName},
-	    match_set(RRNameRef, ?DNS_TYPE_NSEC3);
+	    hd(get_set(RRNameRef, ?DNS_TYPE_NSEC3));
 	false ->
 	    Hash = get_nsec3_hash(ZoneRef, Name),
-	    do_get_nsec3_cover(SerialRef, Hash, NSEC3)
+	    do_get_nsec3_cover(SerialRef, Hash, NSEC3 ++ [hd(NSEC3)])
     end.
 
 do_get_nsec3_cover(SerialRef, Hash, [#nsec3{hash = Hash1, hashdn = HashDN},
 				     #nsec3{hash = Hash2}|_])
   when Hash > Hash1 andalso Hash < Hash2 ->
     RRNameRef = #rrname_ref{serial_ref = SerialRef, name = HashDN},
-    match_set(RRNameRef, ?DNS_TYPE_NSEC3);
+    hd(get_set(RRNameRef, ?DNS_TYPE_NSEC3));
 do_get_nsec3_cover(SerialRef, Hash, [_|[_|_] = Hashes]) ->
     do_get_nsec3_cover(SerialRef, Hash, Hashes);
 do_get_nsec3_cover(SerialRef, _Hash, [#nsec3{hashdn = HashDN}]) ->
     RRNameRef = #rrname_ref{serial_ref = SerialRef, name = HashDN},
-    match_set(RRNameRef, ?DNS_TYPE_NSEC3).
+    hd(get_set(RRNameRef, ?DNS_TYPE_NSEC3)).
 
 get_nsec3_hash(#zone_ref{name = ZoneName}, Name) ->
     ZoneNameLabels = dns:dname_to_labels(ZoneName),
@@ -170,93 +169,85 @@ get_nsec3_hash(#zone_ref{name = ZoneName}, Name) ->
 	ets:lookup_element(?TAB_ZONE, ZoneNameLabels, #zone.nsec3),
     dnssec:ih(Hash, Salt, dns:encode_dname(Name), Iter).
 
-match_set(#rrname_ref{name = Name} = RRNameRef, QType) ->
-    match_set(Name, RRNameRef, QType).
+get_set(#rrname_ref{name = Name} = RRNameRef, QType) ->
+    get_set(#rrset_ref{rrname_ref = RRNameRef, type = QType}, Name);
+get_set(#rrset_ref{rrname_ref = RRNameRef, type = ?DNS_TYPE_ANY}, QName) ->
+    Types = ets:lookup_element(?TAB_RRNAME, RRNameRef, #rrname.types),
+    MatchSpecs = [{#rrset{ref = #rrset_ref{rrname_ref = RRNameRef, type = Type},
+			  _ = '_'}, [], ['$_']}
+		  || Type <- Types ],
+    [ Set#rrset{name = QName} || Set <- ets:select(?TAB_RRSET, MatchSpecs) ];
+get_set(#rrset_ref{} = Ref, QName) ->
+    [ Set#rrset{name = QName} || Set <- ets:lookup(?TAB_RRSET, Ref) ].
 
-match_set(QName, #rrname_ref{} = RRNameRef, QType) ->
-    {match, RR} = lookup_set(QName, RRNameRef, QType),
-    RR.
+get_set(#serial_ref{} = SerialRef, Name, Type) ->
+    NameRef = #rrname_ref{serial_ref = SerialRef,
+			  name = dns:dname_to_lower(Name)},
+    SetRef = #rrset_ref{rrname_ref = NameRef, type = Type},
+    get_set(SetRef, Name).
 
-get_set_list(#serial_ref{} = SerialRef) ->
-    ets:lookup_element(?TAB_RRMAP, SerialRef, #rrmap.sets).
 
 lookup_cut(#rrname_ref{} = Ref) ->
     ets:lookup_element(?TAB_RRNAME, Ref, #rrname.cutby).
 
-lookup_set(#rrset_ref{} = Ref, QName) ->
-    case ets:lookup(?TAB_RRSET, Ref) of
-	[#rrset{} = Set] -> Set#rrset{name = QName};
-	[] -> undefined
-    end.
+get_all_sets(#serial_ref{} = SerialRef) ->
+    SetList = ets:lookup_element(?TAB_RRMAP, SerialRef, #rrmap.sets),
+    MatchSpecs = [{#rrset{ref = #rrset_ref{rrname_ref = #rrname_ref{
+					     serial_ref = SerialRef,
+					     name = Name},
+					   type = Type},
+			  _ = '_'}, [], ['$_']}
+		  || {Name, Types} <- SetList, Type <- Types ],
+    ets:select(?TAB_RRSET, MatchSpecs).
 
-lookup_set(#serial_ref{} = SerialRef, QName, Name, Type) ->
+lookup_sets(#serial_ref{} = SerialRef, QName, Name, Type) ->
     NameRef = #rrname_ref{serial_ref = SerialRef, name = Name},
-    lookup_set(QName, NameRef, Type).
-
-lookup_set(QName, #rrname_ref{name = Name} = NameRef, QType) ->
-    ZoneName = zonename_from_ref(NameRef),
-    SetRef = #rrset_ref{rrname_ref = NameRef, type = QType},
-    case lookup_set(SetRef, QName) of
-	undefined when QType =:= ?DNS_TYPE_NS -> nodata;
-	undefined ->
+    SetRef = #rrset_ref{rrname_ref = NameRef, type = Type},
+    case get_set(SetRef, QName) of
+	[] when Type =:= ?DNS_TYPE_NS -> nodata;
+	[] ->
 	    SetRefCname = SetRef#rrset_ref{type = ?DNS_TYPE_CNAME},
-	    case lookup_set(SetRefCname, QName) of
-		undefined ->
+	    case get_set(SetRefCname, QName) of
+		[] ->
 		    case lookup_cut(NameRef) of
 			undefined -> nodata;
 			CutBy ->
 			    CutNameRef = NameRef#rrname_ref{name = CutBy},
-			    CutRR = match_set(CutNameRef, ?DNS_TYPE_NS),
-			    {referral, CutRR, undefined}
+			    NS = get_set(CutNameRef, ?DNS_TYPE_NS),
+			    DS = get_set(CutNameRef, ?DNS_TYPE_DS),
+			    Ad = get_glue(SerialRef, NS),
+			    {cut, NS, DS, Ad}
 		    end;
-		#rrset{cutby = undefined, type = ?DNS_TYPE_CNAME,
-		       data = [#dns_rrdata_cname{dname = NewQName}]} = Set ->
-		    {match, NewQName, Set};
-		#rrset{cutby = CutBy, type = ?DNS_TYPE_CNAME,
-		       data = [#dns_rrdata_cname{}]} = Set ->
+		[#rrset{cutby = undefined}|_] = Matches -> {match, Matches};
+		[#rrset{cutby = CutBy}|_] ->
 		    CutNameRef = NameRef#rrname_ref{name = CutBy},
-		    CutRR = match_set(CutNameRef, ?DNS_TYPE_NS),
-		    {referral, CutRR, Set}
+		    NS = get_set(CutNameRef, ?DNS_TYPE_NS),
+		    DS = get_set(CutNameRef, ?DNS_TYPE_DS),
+		    Ad = get_glue(SerialRef, NS),
+		    {cut, NS, DS, Ad}
 	    end;
-	#rrset{cutby = CutBy, type = QType} = Set
-	  when CutBy =:= undefined orelse CutBy =:= ZoneName ->
-	    {match, Set};
-	#rrset{cutby = Name, type = ?DNS_TYPE_NS} = Set ->
-	    {referral, Set, undefined};
-	#rrset{cutby = CutBy, type = QType} = Set ->
+	[#rrset{cutby = undefined}|_] = Matches -> {match, Matches};
+	[#rrset{cutby = CutBy}|_] ->
 	    CutNameRef = NameRef#rrname_ref{name = CutBy},
-	    {referral, CutRR, undefined} = lookup_set(CutBy, CutNameRef,
-						      ?DNS_TYPE_NS),
-	    {referral, CutRR, Set}
+	    NS = get_set(CutNameRef, ?DNS_TYPE_NS),
+	    DS = get_set(CutNameRef, ?DNS_TYPE_DS),
+	    Ad = get_glue(SerialRef, NS),
+	    {cut, NS, DS, Ad}
     end.
 
-lookup_sets(#serial_ref{} = SerialRef, QName, Name) ->
+get_glue(#serial_ref{} = Ref, [#rrset{}] = NS) -> get_glue(Ref, NS, []).
+
+get_glue(#serial_ref{} = Ref, [#rrset{add_dnames = GlueNames}], Ad)
+  when is_list(Ad) -> get_glue(Ref, GlueNames, lists:reverse(Ad));
+get_glue(#serial_ref{} = SerialRef, [Name|Names], Ad) ->
     NameRef = #rrname_ref{serial_ref = SerialRef, name = Name},
-    Types = ets:lookup_element(?TAB_RRNAME, NameRef, #rrname.types),
-    lookup_sets(NameRef, QName, Types, []).
-
-lookup_sets(#rrname_ref{} = NameRef, QName, [Type|Types], Sets) ->
-    SetRef = #rrset_ref{rrname_ref = NameRef, type = Type},
-    Set = lookup_set(SetRef, QName),
-    NewSets = [Set|Sets],
-    lookup_sets(NameRef, QName, Types, NewSets);
-lookup_sets(#rrname_ref{name = Name, serial_ref = SerialRef}, _QName,
-	    [], [#rrset{cutby = CutBy}|_] = Sets)
-  when CutBy =/= undefined ->
-    if CutBy =:= Name -> {match, Sets};
-       true ->
-	    CutSet = get_set(SerialRef, CutBy, ?DNS_TYPE_NS),
-	    {cut, CutSet, Sets}
-    end;
-lookup_sets(_NameRef, _QName, [], Sets) -> {match, Sets}.
-
-get_set(#serial_ref{} = SerialRef, Name, Type) ->
-    NameRef= #rrname_ref{serial_ref = SerialRef, name = Name},
-    SetRef = #rrset_ref{rrname_ref = NameRef, type = Type},
-    case ets:lookup(?TAB_RRSET, SetRef) of
-	[] -> undefined;
-	[#rrset{} = Set] -> Set
-    end.
+    Fun = fun(Type, Acc) ->
+		  [ Set || Set <- get_set(NameRef, Type),
+			   not lists:member(Set, Ad) ] ++ Acc
+	  end,
+    Ad0 = lists:foldl(Fun, Ad, [?DNS_TYPE_A, ?DNS_TYPE_AAAA]),
+    get_glue(SerialRef, Names, Ad0);
+get_glue(#serial_ref{}, [], Ad) when is_list(Ad) -> lists:reverse(Ad).
 
 zone_for_name(Name) when is_binary(Name) ->
     zone_for_name(undefined, [], lists:reverse(dns:dname_to_labels(Name))).
@@ -426,17 +417,13 @@ clean_zone(ZoneRef, [Serial|Serials]) ->
     clean_zone(ZoneRef, Serials);
 clean_zone(_ZoneRef, []) -> ok.
 
-insert_zone(#dnsxd_zone{name = ZoneName, soa_param = SOA, nsec3 = NSEC3Rec,
-			dnssec_enabled = DNSSEC} = Zone)
-  when is_binary(ZoneName) ->
-    NSEC3 = if DNSSEC -> NSEC3Rec;
-	       true -> undefined end,
+insert_zone(#dnsxd_zone{name = ZoneName} = Zone) when is_binary(ZoneName) ->
     ets:delete(?TAB_RELOAD, ZoneName),
     FailedPreviously = ets:member(?TAB_BADZONE, ZoneName),
     TempTab = ets:new(dnsxd_tmp_lz, [public, duplicate_bag]),
     Ref = make_ref(),
     case dnsxd_zone:prepare(TempTab, Ref, #dnsxd_zone{} = Zone) of
-	{ok, Serials, AXFR} ->
+	{ok, Serials, SOA, NSEC3, AXFR} ->
 	    if FailedPreviously -> ets:delete(?TAB_BADZONE, ZoneName);
 	       true -> ok end,
 	    ok = insert_from_temp_tab(TempTab),
@@ -521,15 +508,6 @@ insert_from_temp_tab_cont(Cont) ->
 	    [ ets:insert(tab(Rec), Rec) || Rec <- Recs ],
 	    insert_from_temp_tab_cont(NewCont);
 	'$end_of_table' -> ok
-    end.
-
-get_cutters_set(#serial_ref{} = SerialRef, Name) ->
-    NameRef = #rrname_ref{serial_ref = SerialRef, name = Name},
-    case ets:lookup_element(?TAB_RRNAME, NameRef, #rrname.cutby) of
-	undefined -> undefined;
-	CutBy ->
-	    CutNameRef = NameRef#rrname_ref{name = CutBy},
-	    match_set(CutNameRef, ?DNS_TYPE_NS)
     end.
 
 nametree_lookup(ZoneName, ZoneName, _Tree) -> {found, ZoneName};

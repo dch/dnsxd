@@ -43,8 +43,7 @@ handle(MsgCtx, #dns_message{
 		    [{rc, ?DNS_RCODE_REFUSED}];
 		false ->
 		    ?DNSXD_INFO("Allowing AXFR of ~s to ~s:~p", MsgArgs),
-		    Sets = dnsxd_ds_server:get_set_list(ZoneRef),
-		    [{an, collect_sets(ZoneRef, Sets)}, {dnssec, true}]
+		    [{an, sets(ZoneRef)}, {dnssec, true}]
 	    end,
     MsgCtx0 = dnsxd_op_ctx:tc_mode(MsgCtx, axfr),
     dnsxd_op_ctx:reply(MsgCtx0, ReqMsg, Props).
@@ -59,22 +58,8 @@ allow(Zone, SrcIP) ->
 	Hosts when is_list(Hosts) -> lists:member(SrcIP, Hosts)
     end.
 
-collect_sets(ZoneRef, Sets) -> collect_sets(ZoneRef, Sets, []).
-
-collect_sets(ZoneRef, [{Name, Types}|Sets], RR) ->
-    RR0 = collect_sets(ZoneRef, Name, Types, RR),
-    collect_sets(ZoneRef, Sets, RR0);
-collect_sets(ZoneRef, [], RR) ->
-    Name = dnsxd_ds_server:zonename_from_ref(ZoneRef),
-    Set = dnsxd_ds_server:get_set(ZoneRef, Name, ?DNS_TYPE_SOA),
-    SetNoSig = Set#rrset{sig = []},
-    [Set|lists:reverse([SetNoSig|RR])].
-
-collect_sets(ZoneRef, Name, [?DNS_TYPE_DS|Types], RR) ->
-    collect_sets(ZoneRef, Name, Types, RR);
-collect_sets(ZoneRef, Name, [?DNS_TYPE_SOA|Types], RR) ->
-    collect_sets(ZoneRef, Name, Types, RR);
-collect_sets(ZoneRef, Name, [Type|Types], RR) ->
-    Set = dnsxd_ds_server:get_set(ZoneRef, Name, Type),
-    collect_sets(ZoneRef, Name, Types, [Set|RR]);
-collect_sets(_ZoneRef, _Name, [], RR) -> RR.
+sets(ZoneRef) ->
+    Sets = dnsxd_ds_server:get_all_sets(ZoneRef),
+    {value, SOASet, Sets0} = lists:keytake(?DNS_TYPE_SOA, #rrset.type, Sets),
+    LastSOASet = SOASet#rrset{sig = []},
+    [SOASet|Sets0] ++ [LastSOASet].

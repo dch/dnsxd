@@ -27,169 +27,200 @@
 %%% API
 %%%===================================================================
 
-handle(MsgCtx, #dns_message{qc = 1,
-			    questions = [#dns_query{name = QName,
-						    class = ?DNS_CLASS_IN,
-						    type = Type}]
-			   } = ReqMsg) ->
+handle(MsgCtx, #dns_message{qc = 1, questions = [Query]} = Msg) ->
+    DoDNSSEC = do_dnssec(Msg),
+    Props = answer(Query, DoDNSSEC),
+    dnsxd_op_ctx:reply(MsgCtx, Msg, Props).
+
+do_dnssec(#dns_message{additional=[#dns_optrr{dnssec = DNSSEC}|_]}) -> DNSSEC;
+do_dnssec(#dns_message{}) -> false.
+
+answer(#dns_query{name = QName, type = Type}, DoDNSSEC) ->
     Name = dns:dname_to_lower(QName),
-    Props0 = case dnsxd_ds_server:zone_ref_for_name(Name) of
-		 undefined -> [{rc, ?DNS_RCODE_REFUSED}];
-		 Ref ->
-		     DNSSEC = do_dnssec(ReqMsg, Ref),
-		     Props = [{aa, true}, {ad, []}, {an, []}, {au, []},
-			      {dnssec, DNSSEC}, {rc, ?DNS_RCODE_NXDOMAIN}],
-		     answer(QName, Name, Type, Ref, Props)
-	     end,
-    dnsxd_op_ctx:reply(MsgCtx, ReqMsg, Props0);
-handle(MsgCtx, #dns_message{} = ReqMsg) ->
-    dnsxd_op_ctx:reply(MsgCtx, ReqMsg, [{rc, ?DNS_RCODE_REFUSED}]).
+    case dnsxd_ds_server:find_zone(Name) of
+	undefined -> [{rc, ?DNS_RCODE_REFUSED}];
+	ZoneRef ->
+	    DNSSEC = DoDNSSEC andalso dnsxd_ds_server:is_dnssec_zone(ZoneRef),
+	    Props = orddict:from_list([{aa, true}, {ad, []}, {an, []}, {au, []},
+				       {any, ?DNS_TYPE_ANY =:= Type},
+				       {dnssec, DNSSEC}, {followed, []},
+				       {rc, ?DNS_RCODE_NXDOMAIN}]),
+	    answer(QName, Name, Type, ZoneRef, Props)
+    end.
 
-do_dnssec(#dns_message{additional=[#dns_optrr{dnssec = DNSSEC}|_]}, Ref) ->
-    DNSSEC andalso dnsxd_ds_server:is_dnssec_zone(Ref);
-do_dnssec(#dns_message{}, _Ref) -> false.
-
-answer(QName, Name, ?DNS_TYPE_ANY, Ref, Props) ->
-    DNSSEC = orddict:fetch(dnssec, Props),
-    case dnsxd_ds_server:lookup_rrname(Ref, Name) of
-	{found, Name} ->
-	    Props0 = orddict:store(rc, ?DNS_RCODE_NOERROR, Props),
-	    case dnsxd_ds_server:lookup_sets(Ref, QName, Name) of
-		{match, Sets} ->
-		    Props1 = orddict:append_list(an, Sets, Props0),
-		    authority(Ref, Props1);
-		{cut, CutSet, Sets} ->
-		    Props1 = orddict:append(au, CutSet, Props0),
-		    orddict:append_list(ad, Sets, Props1)
-	    end;
-	{found_wild, _LastName, PlainName, WildName} ->
-	    Props0 = orddict:store(rc, ?DNS_RCODE_NOERROR, Props),
-	    Props1 = append_nsec3_cover(Ref, PlainName, Props0, DNSSEC),
-	    case dnsxd_ds_server:lookup_sets(Ref, QName, WildName) of
-		{match, Sets} ->
-		    Props2 = orddict:append_list(an, Sets, Props1),
-		    authority(Ref, Props2);
-		{cut, CutSet, Sets} ->
-		    Props2 = orddict:append_list(au, CutSet, Props1),
-		    Props3 = orddict:append_list(ad, Sets, Props2),
-		    orddict:append_list(ad, Sets, Props3)
-	    end;
-	{no_name, LastName, PlainName, WildName} ->
-	    case dnsxd_ds_server:get_cutters_set(Ref, LastName) of
-		undefined ->
-		    Cover = [LastName, PlainName, WildName],
-		    Props0 = append_nsec3_cover(Ref, Cover, Props, DNSSEC),
-		    authority(Ref, Props0);
-		CutRR ->
-		    Props0 = orddict:append(au, CutRR, Props),
-		    Cover = case parent(LastName) of
-				undefined -> [LastName];
-				ParentName -> [ParentName, LastName]
-			    end,
-		    Props1 = append_nsec3_cover(Ref, Cover, Props0, DNSSEC),
-		    authority(Ref, Props1)
-	    end
-    end;
 answer(QName, Name, Type, Ref, Props) ->
     DNSSEC = orddict:fetch(dnssec, Props),
+    Followed = [] =/= orddict:fetch(followed, Props),
     case dnsxd_ds_server:lookup_rrname(Ref, Name) of
 	{found, Name} ->
 	    Props0 = orddict:store(rc, ?DNS_RCODE_NOERROR, Props),
-	    case dnsxd_ds_server:lookup_set(Ref, QName, Name, Type) of
+	    case dnsxd_ds_server:lookup_sets(Ref, QName, Name, Type) of
+		nodata when Followed -> Props;
 		nodata ->
-		    Props1 = append_nsec3_cover(Ref, Name, Props0, DNSSEC),
-		    authority(Ref, Props1);
-		{match, RR} ->
-		    Props1 = orddict:append(an, RR, Props0),
-		    authority(Ref, Props1);
-		{match, NewQName, RR} ->
-		    Props1 = orddict:append(an, RR, Props0),
-		    case follow_cname(Ref, Props1, NewQName) of
-			true -> answer(NewQName, NewQName, Type, Ref, Props1);
-			false -> authority(Ref, Props1)
+		    Props1 = append_au_soa(Ref, Props0),
+		    if DNSSEC -> append_nsec3_cover(Ref, Name, Props1);
+				true -> Props1 end;
+		{match, Matches} ->
+		    case handle_match(Ref, Type, Matches, Props0) of
+			{done, Props1} -> Props1;
+			{follow, NewQName, Props1} ->
+			    NewName = dns:dname_to_lower(NewQName),
+			    answer(NewQName, NewName, Type, Ref, Props1)
 		    end;
-		{referral, CutRR, AdRR} ->
-		    Props1 = case CutRR of
-				 undefined -> Props0;
-				 CutRR -> orddict:append(au, CutRR, Props0)
-			     end,
-		    Props2 = add_ds(Ref, CutRR, Props1, DNSSEC),
-		    Props3 = case AdRR of
-				 undefined -> Props2;
-				 AdRR -> orddict:append(ad, AdRR, Props2)
-			     end,
-		    additional(Ref, Props3)
+		_ when Followed -> Props;
+		{cut, NS, DS, AddSets} ->
+		    handle_cut(Ref, DNSSEC, NS, DS, AddSets, Props0)
 	    end;
 	{found_wild, LastName, PlainName, WildName} ->
 	    Props0 = orddict:store(rc, ?DNS_RCODE_NOERROR, Props),
-	    Props1 = append_nsec3_cover(Ref, PlainName, Props0, DNSSEC),
-	    case dnsxd_ds_server:lookup_set(Ref, QName, WildName, Type) of
+	    case dnsxd_ds_server:lookup_sets(Ref, QName, WildName, Type) of
 		nodata ->
-		    Cover = [WildName, LastName],
-		    Props2 = append_nsec3_cover(Ref, Cover, Props1, DNSSEC),
-		    authority(Ref, Props2);
-		{match, RR} ->
-		    Props2 = orddict:append(an, RR, Props1),
-		    authority(Ref, Props2);
-		{match, NewQName, RR} ->
-		    Props2 = orddict:append_list(an, RR, Props1),
-		    case follow_cname(Ref, Props2, NewQName) of
-			true -> answer(NewQName, NewQName, Type, Ref, Props2);
-			false -> authority(Ref, Props2)
-		    end;
-		{referral, CutRR, AdRR} ->
-		    Props2 = orddict:append_list(au, CutRR, Props1),
-		    Props3 = add_ds(Ref, CutRR, Props2, DNSSEC),
-		    Props4 = case AdRR of
-				 undefined -> Props3;
-				 AdRR -> orddict:append(ad, AdRR, Props3)
-			     end,
-		    additional(Ref, Props4)
-	    end;
-	{no_name, LastName, PlainName, WildName} ->
-	    case dnsxd_ds_server:get_cutters_set(Ref, LastName) of
-		undefined ->
+		    Props1 = append_au_soa(Ref, Props0),
 		    Cover = [LastName, PlainName, WildName],
-		    Props0 = append_nsec3_cover(Ref, Cover, Props, DNSSEC),
-		    authority(Ref, Props0);
-		CutRR ->
-		    Props0 = orddict:append(au, CutRR, Props),
-		    Cover = case parent(LastName) of
-				undefined -> [LastName];
-				ParentName -> [ParentName, LastName]
-			    end,
-		    Props1 = append_nsec3_cover(Ref, Cover, Props0, DNSSEC),
-		    authority(Ref, Props1)
+		    if DNSSEC ->
+			    append_nsec3_cover(Ref, Cover, Props1);
+		       true -> Props1 end;
+		{match, Matches} ->
+		    case handle_match(Ref, Type, Matches, Props0) of
+			{done, Props1} when DNSSEC ->
+			    append_nsec3_cover(Ref, PlainName, Props1);
+			{done, Props1} -> Props1;
+			{follow, NewQName, Props1} when DNSSEC ->
+			    Props2 = append_nsec3_cover(Ref, PlainName, Props1),
+			    NewName = dns:dname_to_lower(NewQName),
+			    answer(NewQName, NewName, Type, Ref, Props2);
+			{follow, NewQName, Props1} ->
+			    NewName = dns:dname_to_lower(NewQName),
+			    answer(NewQName, NewName, Type, Ref, Props1)
+		    end;
+		_ when Followed -> Props;
+		{cut, NS, DS, AddSets} ->
+		    handle_cut(Ref, DNSSEC, NS, DS, AddSets, Props0)
+	    end;
+	_ when Followed -> Props;
+	{no_name, LastName, PlainName, WildName} ->
+	    case dnsxd_ds_server:lookup_sets(Ref, LastName, LastName, Type) of
+		{cut, NS, DS, AddSets} ->
+		    Props0 = orddict:store(rc, ?DNS_RCODE_NOERROR, Props),
+		    Props1 = handle_cut(Ref, DNSSEC, NS, DS, AddSets, Props0),
+		    if DNSSEC ->
+			    case parent(LastName) of
+				undefined -> Props1;
+				ParentName ->
+				    append_nsec3_cover(Ref, ParentName, Props1)
+			    end;
+		       true -> Props1
+		    end;
+		_ when DNSSEC ->
+		    Props0 = append_au_soa(Ref, Props),
+		    Cover = [PlainName, LastName, WildName],
+		    append_nsec3_cover(Ref, Cover, Props0);
+		_ -> append_au_soa(Ref, Props)
 	    end
     end.
 
-authority(Ref, Props) ->
-    Name = dnsxd_ds_server:zonename_from_ref(Ref),
-    An = orddict:fetch(an, Props),
-    Type = case An =:= [] of
-	       true -> ?DNS_TYPE_SOA;
-	       false -> ?DNS_TYPE_NS
+handle_match(Ref, Type, [#rrset{type = ?DNS_TYPE_CNAME = Type} = Set], Props) ->
+    Props0 = append_an_ad(Ref, Set, Props),
+    {done, append_au_ns(Ref, Props0)};
+handle_match(Ref, _Type, [#rrset{type = ?DNS_TYPE_CNAME,
+				 add_dnames = [NewQName]} = Set], Props) ->
+    Props0 = append_an_ad(Ref, Set, Props),
+    Props1 = append_au_ns(Ref, Props0),
+    case follow_cname(Ref, Props1, NewQName) of
+	{Props2, true} -> {follow, NewQName, Props2};
+	{Props2, false} -> {done, Props2}
+    end;
+handle_match(Ref, _Type, Sets, Props) when is_list(Sets) ->
+    Props0 = append_an_ad(Ref, Sets, Props),
+    {done, append_au_ns(Ref, Props0)}.
+
+handle_cut(Ref, true, [#rrset{name = Name} = NS], DS, Add, Props) ->
+    Props0 = append(au, NS, Props),
+    Props1 = append(au, DS, Props0),
+    Props2 = append_nsec3_cover(Ref, Name, Props1),
+    Props3 = append(ad, Add, Props2),
+    orddict:store(aa, false, Props3);
+handle_cut(_Ref, false, NS, DS, Add, Props) ->
+    Add0 = case orddict:fetch(any, Props) of
+	       true -> lists:keysort(#rrset.type, DS ++ Add);
+	       false -> Add
 	   end,
-    case dnsxd_ds_server:lookup_set(Ref, Name, Name, Type) of
-	{match, RRSet} ->
-	    case lists:member(RRSet, An) of
-		true -> additional(Ref, Props);
-		false ->
-		    Au = orddict:fetch(au, Props),
-		    NewAu = [RRSet|Au],
-		    Props0 = orddict:store(au, NewAu, Props),
-		    additional(Ref, Props0)
-	    end;
-	nodata -> additional(Ref, Props)
+    Props0 = orddict:store(aa, false, Props),
+    Props1 = append(au, NS, Props0),
+    append(ad, Add0, Props1).
+
+append(Key, #rrset{} = Set, Props) -> orddict:append(Key, Set, Props);
+append(Key, Sets, Props) when is_list(Sets) ->
+    orddict:append_list(Key, Sets, Props).
+
+append_an_ad(Ref, #rrset{} = Set, Props) ->
+    append_an_ad(Ref, [Set], Props);
+append_an_ad(Ref, Sets, Props) ->
+    Props0 = append(an, Sets, Props),
+    append_ad_from_sets(Ref, Sets, Props0).
+
+append_ad_from_sets(Ref, Sets, Props) ->
+    Existing = lists:foldl(
+	fun(Key, Acc) ->
+		SetsTmp = orddict:fetch(Key, Props),
+		sets:union(Acc, sets:from_list(
+				  [ {dns:dname_to_lower(N), T}
+				    || #rrset{name = N, type = T} <- SetsTmp ]))
+	end, sets:new(), [an, ad, au]),
+    FollowTypes = [ ?DNS_TYPE_MX, ?DNS_TYPE_NS, ?DNS_TYPE_PTR, ?DNS_TYPE_SRV ],
+    Follow0 = [ {Name, Type} || #rrset{add_dnames = Names, type = Type} <- Sets,
+				Name <- Names ],
+    Follow1 = lists:foldl(
+		fun({Name, Type}, Acc) ->
+			Key = {dns:dname_to_lower(Name), Type},
+			IgnoreType = not lists:member(Type, FollowTypes),
+			InExisting = sets:is_element(Key, Existing),
+			InAcc = dict:is_key(Key, Acc),
+			if IgnoreType orelse InExisting orelse InAcc -> Acc;
+			   true -> dict:store(Key, Name, Acc) end
+		end, dict:new(), Follow0),
+    Follow2 = [ {Type, Name} || {{_, Type}, Name} <- dict:to_list(Follow1) ],
+    do_append_ad_from_sets(Ref, Props, Follow2).
+
+do_append_ad_from_sets(Ref, Props, [{SrcType, Name}|Follow]) ->
+    TargetTypes = case SrcType of
+		      ?DNS_TYPE_PTR -> [?DNS_TYPE_DS,
+					?DNS_TYPE_SRV,
+					?DNS_TYPE_TXT];
+		      _ -> [?DNS_TYPE_A, ?DNS_TYPE_AAAA]
+		  end,
+    Fun = fun(Type, PropsTmp) ->
+		  Matches = dnsxd_ds_server:get_set(Ref, Name, Type),
+		  append(ad, Matches, PropsTmp)
+	  end,
+    Props0 = lists:foldl(Fun, Props, TargetTypes),
+    do_append_ad_from_sets(Ref, Props0, Follow);
+do_append_ad_from_sets(_Ref, Props, []) -> Props.
+
+append_au_ns(Ref, Props) ->
+    case orddict:is_key(append_au_ns, Props) of
+	true -> Props;
+	false ->
+	    Props0 = orddict:store(append_au_ns, true, Props),
+	    ZoneName = dnsxd_ds_server:zonename_from_ref(Ref),
+	    NS = dnsxd_ds_server:get_set(Ref, ZoneName, ?DNS_TYPE_NS),
+	    An = orddict:fetch(an, Props0),
+	    case lists:member(NS, An) of
+		true -> Props0;
+		false -> append(au, NS, Props0)
+	    end
     end.
 
-additional(_Ref, Props) -> Props.
+append_au_soa(Ref, Props) ->
+    ZoneName = dnsxd_ds_server:zonename_from_ref(Ref),
+    SOA = dnsxd_ds_server:get_set(Ref, ZoneName, ?DNS_TYPE_SOA),
+    append(au, SOA, Props).
 
-append_nsec3_cover(_Ref, _Names, Props, false) -> Props;
-append_nsec3_cover(Ref, Name, Props, true) when is_binary(Name) ->
+append_nsec3_cover(Ref, Name, Props) when is_binary(Name) ->
     append_nsec3_cover(Ref, [Name], Props, []);
-append_nsec3_cover(Ref, Names, Props, true) when is_list(Names) ->
-    append_nsec3_cover(Ref, Names, Props, []);
+append_nsec3_cover(Ref, Names, Props) when is_list(Names) ->
+    append_nsec3_cover(Ref, lists:reverse(Names), Props, []).
+
 append_nsec3_cover(Ref, [Name|Names], Props, Collected) ->
     Cover = dnsxd_ds_server:get_nsec3_cover(Ref, Name),
     case lists:member(Cover, Collected) of
@@ -201,36 +232,17 @@ append_nsec3_cover(Ref, [Name|Names], Props, Collected) ->
 append_nsec3_cover(_Ref, [], Props, Collected) ->
     orddict:append_list(au, Collected, Props).
 
-follow_cname(Ref, Results, NameM) ->
-    An = orddict:fetch(an, Results),
-    case lists:keymember(NameM, #rrset.name, An) of
-	true -> false;
+follow_cname(ZoneRef, Props, NameM) ->
+    Name = dns:dname_to_lower(NameM),
+    Followed = orddict:fetch(followed, Props),
+    case lists:member(Name, Followed) of
+	true -> throw({cname_loop, Name});
 	false ->
-	    Name = dns:dname_to_lower(NameM),
-	    case dnsxd_ds_server:zonename_from_ref(Ref) of
-		NameM -> true;
-		ZoneName ->
-		    NameSize = byte_size(Name),
-		    ZoneNameSize = byte_size(Name),
-		    if (ZoneNameSize + 1) >= NameSize -> false;
-		       true ->
-			    Pre = NameSize - ZoneNameSize - 1,
-			    case Name of
-				<<_:Pre/binary, $., ZoneName/binary>> -> true;
-				_ -> false
-			    end
-		    end
-	    end
+	    Props0 = orddict:append(followed, Name, Props),
+	    {Props0, ZoneRef =:= dnsxd_ds_server:find_zone(Name)}
     end.
 
 parent(<<$., Name/binary>>) -> Name;
 parent(<<"\\.", Name/binary>>) -> parent(Name);
 parent(<<_, Name/binary>>) -> parent(Name);
 parent(<<>>) -> undefined.
-
-add_ds(Ref, #rrset{name = Name, type = ?DNS_TYPE_NS} = NSSet, Props, true) ->
-    case dnsxd_ds_server:lookup_set(Ref, Name, Name, ?DNS_TYPE_DS) of
-	{referral, NSSet, DSSet} -> orddict:append(au, DSSet, Props);
-	_ -> Props
-    end;
-add_ds(_Ref, _RR, Props, _DNSSEC) -> Props.

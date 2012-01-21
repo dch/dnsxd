@@ -68,17 +68,18 @@ dispatch(MsgCtx, #dns_message{} = ReqMsg) ->
 %%% Internal functions
 %%%===================================================================
 
-handler(#dns_message{oc = ?DNS_OPCODE_QUERY,
-		     qc = 1,
+handler(#dns_message{oc = ?DNS_OPCODE_QUERY, qc = 1,
 		     questions = [#dns_query{type = ?DNS_TYPE_MAILA}]}) ->
     fun dnsxd_op_notimp:handle/2;
 handler(#dns_message{oc = ?DNS_OPCODE_QUERY, qc = 1,
 		     questions = [#dns_query{type = ?DNS_TYPE_MAILB}]}) ->
     fun dnsxd_op_notimp:handle/2;
 handler(#dns_message{oc = ?DNS_OPCODE_QUERY, qc = 1,
-		     questions = [#dns_query{type = ?DNS_TYPE_AXFR}]}) ->
+		     questions = [#dns_query{class = ?DNS_CLASS_IN,
+					     type = ?DNS_TYPE_AXFR}]}) ->
     fun dnsxd_op_axfr:handle/2;
-handler(#dns_message{oc = ?DNS_OPCODE_QUERY, qc = 1} = Msg) ->
+handler(#dns_message{oc = ?DNS_OPCODE_QUERY, qc = 1,
+		     questions = [#dns_query{class = ?DNS_CLASS_IN}]} = Msg) ->
     case has_llq(Msg) of
 	true -> fun dnsxd_op_llq:handle/2;
 	false -> fun dnsxd_op_query:handle/2
@@ -144,7 +145,7 @@ verify_tsig(MsgCtx, #dns_message{oc = OC} = ReqMsg,
 		    dnsxd_op_ctx:to_wire(MsgCtx, RespMsg)
 	    end;
 	undefined ->
-	    case dnsxd_ds_server:zone_ref_for_name(KeyName) of
+	    case dnsxd_ds_server:find_zone(KeyName) of
 		undefined -> ok;
 		ZoneRef ->
 		    ZoneName = dnsxd_ds_server:zonename_from_ref(ZoneRef),

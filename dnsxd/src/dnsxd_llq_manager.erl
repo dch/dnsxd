@@ -151,7 +151,7 @@ servfull(#state{llq_count = Count}) ->
 start_new_llq(SupPid, #dns_query{name = NameM} = Q, ClientPid, MsgCtx,
 	      ClientDNSSEC) ->
     Name = dns:dname_to_lower(NameM),
-    ZoneRef = dnsxd_ds_server:zone_ref_for_name(Name),
+    ZoneRef = dnsxd_ds_server:find_zone(Name),
     Refuse = case ZoneRef of
 		 undefined -> true;
 		 ZoneRef -> dnsxd_ds_server:is_cut(ZoneRef, Name)

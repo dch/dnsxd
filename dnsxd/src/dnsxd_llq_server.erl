@@ -46,8 +46,7 @@
 		protocol_ref,
 		zone_changed = false,
 		pending_events = [],
-		pending_ref,
-		keepalive_ref
+		event_ref
 	       }).
 -record(event, {id, changes, send_count, last_sent = dns:unix_time()}).
 
@@ -97,15 +96,15 @@ init([Pid, Id, ZoneName, MsgCtx, Q, DoDNSSEC]) ->
 					  {tcp, Pid,
 					   erlang:monitor(process, Pid)}
 				  end,
-    {_LeaseLife, State} = set_lease_life(?DEFAULT_MAX_LEASE_LIFE,
-					 #state{id = Id,
-						zonename = ZoneName,
-						msgctx = MsgCtx,
-						q = Q,
-						do_dnssec = DoDNSSEC,
-						protocol = Proto,
-						protocol_pid = ProtoPid,
-						protocol_ref = ProtoRef}),
+    State = set_lease_life(?DEFAULT_MAX_LEASE_LIFE,
+			   #state{id = Id,
+				  zonename = ZoneName,
+				  msgctx = MsgCtx,
+				  q = Q,
+				  do_dnssec = DoDNSSEC,
+				  protocol = Proto,
+				  protocol_pid = ProtoPid,
+				  protocol_ref = ProtoRef}),
     {ok, State}.
 
 handle_call({error, _MsgCtx, Msg}, _From, #state{} = State) ->
@@ -115,19 +114,21 @@ handle_call({error, _MsgCtx, Msg}, _From, #state{} = State) ->
 handle_call({setup_request, MsgCtx, Msg}, _From,
 	    #state{active = false, id = Id, do_dnssec = DoDNSSEC} = State) ->
     #dns_opt_llq{leaselife = ReqLeaseLife} = ReqLLQ = extract_llq(Msg),
-    {LeaseLife, NewState} = set_lease_life(ReqLeaseLife, State),
-    RespLLQ = ReqLLQ#dns_opt_llq{id = Id, leaselife = LeaseLife},
+    State0 = set_lease_life(ReqLeaseLife, State),
+    RespLLQ = ReqLLQ#dns_opt_llq{id = Id, leaselife = lease_life(State)},
     ok = dnsxd_op_ctx:reply(MsgCtx, Msg, [{dnssec, DoDNSSEC}, RespLLQ]),
-    {reply, ok, NewState};
+    {reply, ok, State0};
 handle_call({setup_response, MsgCtx, Msg}, _From,
 	    #state{id = Id, do_dnssec = DoDNSSEC} = State) ->
+    ok = stop_event_timer(State),
     #dns_opt_llq{id = Id, leaselife = ReqLeaseLife} = ReqLLQ = extract_llq(Msg),
-    NewState0 = State#state{active = true, answers = [], pending_events = []},
-    {LeaseLife, NewState1} = set_lease_life(ReqLeaseLife, NewState0),
-    RespLLQ = ReqLLQ#dns_opt_llq{id = Id, leaselife = LeaseLife},
+    State0 = State#state{active = true, answers = [], pending_events = []},
+    State1 = set_lease_life(ReqLeaseLife, State0),
+    RespLLQ = ReqLLQ#dns_opt_llq{id = Id, leaselife = lease_life(State1)},
     ok = dnsxd_op_ctx:reply(MsgCtx, Msg, [{dnssec, DoDNSSEC}, RespLLQ]),
-    NewState2 = send_changes(NewState1),
-    {reply, ok, NewState2};
+    State2 = send_changes(State1),
+    State3 = set_event_timer(State2),
+    {reply, ok, State3};
 handle_call({cancel_lease, MsgCtx, Msg}, _From,
 	    #state{active = true, id = Id, do_dnssec = DoDNSSEC} = State) ->
     #dns_opt_llq{id = Id, leaselife = 0} = LLQ = extract_llq(Msg),
@@ -135,21 +136,23 @@ handle_call({cancel_lease, MsgCtx, Msg}, _From,
     {stop, normal, ok, State};
 handle_call({renew_lease, MsgCtx, Msg}, _From,
 	   #state{active = true, id = Id, do_dnssec = DoDNSSEC} = State) ->
+    ok = stop_event_timer(State),
     #dns_opt_llq{id = Id, leaselife = ReqLeaseLife} = ReqLLQ = extract_llq(Msg),
-    {LeaseLife, NewState0} = set_lease_life(ReqLeaseLife, State),
-    RespLLQ = ReqLLQ#dns_opt_llq{leaselife = LeaseLife},
+    State0 = set_lease_life(ReqLeaseLife, State),
+    RespLLQ = ReqLLQ#dns_opt_llq{leaselife = lease_life(State0)},
     ok = dnsxd_op_ctx:reply(MsgCtx, Msg, [{dnssec, DoDNSSEC}, RespLLQ]),
-    NewState1 = set_keepalive(NewState0),
-    {reply, ok, set_keepalive(NewState1)};
+    State1 = set_event_timer(State0),
+    {reply, ok, State1};
 handle_call({event, _MsgCtx, #dns_message{id = EventId}}, _From,
 	    #state{active = true, zone_changed = ZoneChanged} = State) ->
-    NewState0 = ack_event(EventId, State),
-    NewState1 = case ZoneChanged of
-		    false -> NewState0;
-		    true -> send_changes(NewState0#state{zone_changed = false})
-		end,
-    NewState2 = set_keepalive(NewState1),
-    {reply, ok, NewState2};
+    ok = stop_event_timer(State),
+    State0 = ack_event(EventId, State),
+    State1 = case ZoneChanged of
+		 false -> State0;
+		 true -> send_changes(State0)
+	     end,
+    State2 = set_event_timer(State1),
+    {reply, ok, State2};
 handle_call(Request, _From, State) ->
     ?DNSXD_ERR("Stray call:~n~p~nState:~n~p~n", [Request, State]),
     {noreply, State}.
@@ -157,11 +160,13 @@ handle_call(Request, _From, State) ->
 handle_cast({zone_changed, ZoneName},
 	    #state{zonename = ZoneName, active = true,
 		   pending_events = Events} = State) ->
-    NewState = case Events =:= [] of
-		   true -> send_changes(State);
-		   false -> State#state{zone_changed = true}
-	       end,
-    {noreply, NewState};
+    ok = stop_event_timer(State),
+    State0 = case Events =:= [] of
+		 true -> send_changes(State);
+		 false -> State#state{zone_changed = true}
+	     end,
+    State1 = set_event_timer(State0),
+    {noreply, State1};
 handle_cast({zone_changed, ZoneName}, #state{zonename = ZoneName} = State) ->
     {noreply, State};
 handle_cast(Msg, State) ->
@@ -172,24 +177,23 @@ handle_info({'DOWN', Ref, _Type, _Object,_Info},
 	    #state{protocol_ref = Ref} = State) ->
     ?DNSXD_INFO("Transport down. Stopping"),
     {stop, normal, State};
-handle_info(expire, #state{expire = Expire} = State) ->
-    case dns:unix_time() >= Expire of
-	true -> {stop, normal, State};
-	false ->
-	    NewState = set_expire_timer(State),
-	    {noreply, NewState}
-    end;
+handle_info(expire, #state{} = State) ->
+    ?DNSXD_INFO("Expired. Stopping"),
+    {stop, normal, State};
 handle_info(keepalive, #state{pending_events = []} = State) ->
-    NewState = send_changes(State),
-    {noreply, NewState};
+    ok = stop_event_timer(State),
+    State0 = send_changes(State),
+    State1 = set_event_timer(State0),
+    {noreply, State1};
 handle_info(keepalive, #state{} = State) ->
     {noreply, State};
 handle_info(resend, #state{} = State) ->
+    ok = stop_event_timer(State),
     case resend_changes(State) of
 	{ok, missing_ack} ->
 	    ?DNSXD_INFO("Client not-responding - exiting"),
 	    {stop, normal, State};
-	{ok, #state{} = NewState} -> {noreply, NewState}
+	{ok, #state{} = State0} -> {noreply, set_event_timer(State0)}
     end;
 handle_info(Info, State) ->
     ?DNSXD_ERR("Stray message:~n~p~nState:~n~p~n", [Info, State]),
@@ -207,86 +211,71 @@ extract_llq(
   #dns_message{additional = [#dns_optrr{data = [#dns_opt_llq{} = LLQ]}]}
  ) -> LLQ.
 
-set_lease_life(RequestedLeaseLife, #state{} = State) ->
+lease_life(#state{expire = Expire}) ->
+    case Expire - dns:unix_time() of
+	LeaseLife when LeaseLife < 0 -> 0;
+	LeaseLife -> LeaseLife
+    end.
+
+set_lease_life(RequestedLeaseLife, #state{expire_ref = Ref} = State) ->
+    ok = dnsxd_lib:cancel_timer(Ref),
+    ok = flush(expire),
     MaxLeaseLife = max_lease_life(),
     MinLeaseLife = min_lease_life(),
     GrantedLeaseLife = if RequestedLeaseLife > MaxLeaseLife -> MaxLeaseLife;
 			  RequestedLeaseLife < MinLeaseLife -> MinLeaseLife;
 			  true -> RequestedLeaseLife end,
-    NewExpire = dns:unix_time() + GrantedLeaseLife,
-    NewState = set_expire_timer(State#state{expire = NewExpire}),
-    {GrantedLeaseLife, NewState}.
+    Expire = dns:unix_time() + GrantedLeaseLife,
+    Ref0 = erlang:send_after(GrantedLeaseLife * 1000, self(), expire),
+    State#state{expire = Expire, expire_ref = Ref0}.
 
-set_expire_timer(#state{expire = Expire, expire_ref = Ref} = State)
-  when is_integer(Expire) ->
-    ok = dnsxd_lib:cancel_timer(Ref),
-    ExpireIn = Expire - dns:unix_time(),
-    case ExpireIn > 0 of
-	true ->
-	    NewRef = erlang:send_after(ExpireIn * 1000, self(), expire),
-	    State#state{expire_ref = NewRef};
-	false ->
-	    NewRef = erlang:send_after(0, self(), expire),
-	    State#state{expire_ref = NewRef}
-    end.
-
-set_keepalive(#state{keepalive_ref = Ref, pending_events = []} = State) ->
-    ok = dnsxd_lib:cancel_timer(Ref),
-    NewRef = erlang:send_after(?DEFAULT_KEEPALIVE * 1000, self(), keepalive),
-    State#state{keepalive_ref = NewRef};
-set_keepalive(#state{keepalive_ref = Ref} = State) ->
-    ok = dnsxd_lib:cancel_timer(Ref),
-    State#state{keepalive_ref = undefined}.
-
-resend_changes(#state{pending_events = Events, pending_ref = Ref} = State) ->
-    ok = dnsxd_lib:cancel_timer(Ref),
+resend_changes(#state{pending_events = Events} = State) ->
     Now = dns:unix_time(),
     resend_changes(Now, State#state{pending_events = []}, Events).
 
 resend_changes(_Now, #state{} = State, []) ->
-    NewState = set_resend_timer(State),
-    {ok, NewState};
-resend_changes(Now, #state{}, [#event{send_count = 3, last_sent = LastSent}|_])
-  when (LastSent + 8) < Now ->
-    {ok, missing_ack};
+    {ok, State};
+resend_changes(Now, #state{pending_events = Checked} = State,
+	       [#event{send_count = 3, last_sent = LastSent} = Event
+		|Unchecked]) ->
+    case (LastSent + 8) =< Now of
+	true -> {ok, missing_ack};
+	false ->
+	    State0 = State#state{pending_events = [Event|Checked]},
+	    resend_changes(Now, State0, Unchecked)
+    end;
 resend_changes(Now, #state{id = LLQId, q = Q, msgctx = MsgCtx,
-			   do_dnssec = DoDNSSEC, expire = Expire,
+			   do_dnssec = DoDNSSEC,
 			   pending_events = Checked} = State,
-	       [#event{send_count = Count, last_sent = LastSent,
+	       [#event{id = MsgId, send_count = Count, last_sent = LastSent,
 		       changes = Changes}|Unchecked])
-  when (LastSent + Count * 2) < Now ->
-    LeaseLife = Expire - dns:unix_time(),
+  when (LastSent + Count * 2) =< Now ->
     LLQ = #dns_opt_llq{opcode = ?DNS_LLQOPCODE_EVENT,
 		       errorcode = ?DNS_LLQERRCODE_NOERROR,
 		       id = LLQId,
-		       leaselife = LeaseLife},
+		       leaselife = lease_life(State)},
     OptRR = #dns_optrr{dnssec = DoDNSSEC, data = [LLQ]},
-    Msg = #dns_message{qr = true, aa = true,
+    Msg = #dns_message{id = MsgId, qr = true, aa = true,
 		       qc = 1, questions = [Q],
 		       anc = length(Changes), answers = Changes,
 		       adc = 1, additional = [OptRR]},
     ok =  dnsxd_op_ctx:to_wire(MsgCtx, Msg),
-    NewEvent = #event{id = Msg#dns_message.id, changes = Changes,
-		      send_count = Count + 1, last_sent = Now},
-    NewState = State#state{pending_events = [NewEvent|Checked]},
-    resend_changes(Now, NewState, Unchecked);
+    Event = #event{id = MsgId, changes = Changes, send_count = Count + 1,
+		   last_sent = Now},
+    State0 = State#state{pending_events = [Event|Checked]},
+    resend_changes(Now, State0, Unchecked);
 resend_changes(Now, #state{pending_events = Checked} = State,
 	       [Event|Unchecked]) ->
-    NewState = State#state{pending_events = [Event|Checked]},
-    resend_changes(Now, NewState, Unchecked).
+    State0 = State#state{pending_events = [Event|Checked]},
+    resend_changes(Now, State0, Unchecked).
 
 send_changes(#state{id = LLQId, zonename = ZoneName, q = Q, msgctx = MsgCtx,
-		    do_dnssec = DoDNSSEC, answers = Ans, expire = Expire,
-		    pending_ref = PendingRef, pending_events = Events
-		   } = State) ->
-    ok = dnsxd_lib:cancel_timer(PendingRef),
-    {NewAns, Changes} = changes(ZoneName, Q, DoDNSSEC, Ans),
-    LeaseLife = Expire - dns:unix_time(),
-    NewEvents = send_changes(Events, MsgCtx, LLQId, Q, DoDNSSEC, Changes,
-			     LeaseLife),
-    NewState = State#state{answers = NewAns, pending_events = NewEvents,
-			   zone_changed = false},
-    set_resend_timer(NewState).
+		    do_dnssec = DoDNSSEC, answers = Ans,
+		    pending_events = Events} = State) ->
+    {Ans0, Changes} = changes(ZoneName, Q, DoDNSSEC, Ans),
+    Events0 = send_changes(Events, MsgCtx, LLQId, Q, DoDNSSEC, Changes,
+			   lease_life(State)),
+    State#state{answers = Ans0, pending_events = Events0, zone_changed = false}.
 
 send_changes(Events, MsgCtx, LLQId, Q, DoDNSSEC, Changes, LeaseLife) ->
     MsgId = send_changes_mkid(Events),
@@ -307,14 +296,14 @@ send_changes(Events, MsgCtx, LLQId, Q, DoDNSSEC, Changes, LeaseLife) ->
     case dns:encode_message(Msg, [{max_size, MaxSize},{tc_mode, llq_event}]) of
 	{false, Bin} when is_binary(Bin) ->
 	    dnsxd_op_ctx:send(MsgCtx, Bin),
-	    NewEvent = #event{id = MsgId, changes = Changes, send_count = 1},
-	    [NewEvent|Events];
+	    Event = #event{id = MsgId, changes = Changes, send_count = 1},
+	    [Event|Events];
 	{true, Bin, #dns_message{answers = LeftoverChanges}} ->
 	    dnsxd_op_ctx:send(MsgCtx, Bin),
 	    Changes0 = Changes -- LeftoverChanges,
-	    NewEvent = #event{id = MsgId, changes = Changes0, send_count = 1},
-	    NewEvents = [NewEvent|Events],
-	    send_changes(NewEvents, MsgCtx, LLQId, Q, DoDNSSEC, LeftoverChanges,
+	    Event = #event{id = MsgId, changes = Changes0, send_count = 1},
+	    Events0 = [Event|Events],
+	    send_changes(Events0, MsgCtx, LLQId, Q, DoDNSSEC, LeftoverChanges,
 			 LeaseLife)
     end.
 
@@ -325,31 +314,38 @@ send_changes_mkid(Events) ->
 	false -> Id
     end.
 
-set_resend_timer(#state{pending_ref = Ref, pending_events = Events} = State) ->
+set_event_timer(#state{pending_events = Events} = State) ->
+    ok = stop_event_timer(State),
+    {After, Message} = case Events =:= [] of
+			   true -> {keep_alive_period(), keepalive};
+			   false -> {next_resend(Events), resend}
+		       end,
+    Ref0 = erlang:send_after(After, self(), Message),
+    State#state{event_ref = Ref0}.
+
+stop_event_timer(#state{event_ref = Ref}) ->
     ok = dnsxd_lib:cancel_timer(Ref),
-    NextResend = next_resend(Events),
-    NewRef = erlang:send_after(NextResend * 1000, self(), resend),
-    State#state{pending_ref = NewRef}.
+    ok = flush(resend),
+    ok = flush(keepalive).
 
-next_resend(Events) -> next_resend(dns:unix_time(), Events, 8).
+flush(Term) -> receive Term -> flush(Term) after 0 -> ok end.
 
-next_resend(_Now, [], Seconds) -> Seconds;
-next_resend(Now, [#event{send_count = Count,
-			 last_sent = LastSent}|Events], Seconds)
-  when ((LastSent + (Count * 2)) - Now) < Seconds ->
-    NewSeconds = ((LastSent + (Count * 2)) - Now),
-    case NewSeconds =< 0 of
-	true -> 0;
-	false -> next_resend(Now, Events, NewSeconds)
-    end;
-next_resend(Now, [_|Events], Seconds) -> next_resend(Now, Events, Seconds).
+next_resend(Events) ->
+    Fun = fun(#event{last_sent = LastSent, send_count = Count}, Tmp) ->
+		  case LastSent + Count * 2 of
+		      Tmp0 when Tmp =:= undefined orelse Tmp0 < Tmp -> Tmp0;
+		      _ -> Tmp
+		  end
+	  end,
+    SecondsAway = lists:foldl(Fun, undefined, Events) - dns:unix_time(),
+    if SecondsAway < 0 -> 0; true -> SecondsAway * 1000 end.
 
-changes(ZoneName, #dns_query{name = QName, type = Type}, DNSSEC, LastAns) ->
+changes(_ZoneName, #dns_query{name = QName, type = Type}, DNSSEC, LastAns) ->
     Name = dns:dname_to_lower(QName),
-    ZoneRef = dnsxd_ds_server:get_zone(ZoneName),
+    ZoneRef = dnsxd_ds_server:find_zone(Name),
     CurAns = case dnsxd_ds_server:get_set(ZoneRef, Name, Type) of
-		 undefined -> [];
-		 #rrset{} = Set -> set_to_ans(QName, Set, DNSSEC)
+		 [] -> [];
+		 [#rrset{} = Set] -> set_to_ans(QName, Set, DNSSEC)
 	     end,
     Added = [ RR#dns_rr{ttl = 1} || RR <- CurAns -- LastAns ],
     Removed =[ RR#dns_rr{ttl = -1} || RR <- LastAns -- CurAns ],
@@ -367,7 +363,7 @@ set_to_ans(QName, #rrset{sig = Sigs} = Set, true) ->
 
 ack_event(EventId, #state{pending_events = Events} = State) ->
     case lists:keytake(EventId, #event.id, Events) of
-	{value, _Event, NewEvents} -> State#state{pending_events = NewEvents};
+	{value, _Event, Events0} -> State#state{pending_events = Events0};
 	false -> State
     end.
 
@@ -376,6 +372,9 @@ max_lease_life() ->
 
 min_lease_life() ->
     proplists:get_value(min_length, llq_opts(), ?DEFAULT_MIN_LEASE_LIFE).
+
+keep_alive_period() ->
+    proplists:get_value(udp_keepalive, llq_opts(), ?DEFAULT_KEEPALIVE) * 1000.
 
 llq_opts() ->
     case dnsxd:get_env(llq_opts) of
