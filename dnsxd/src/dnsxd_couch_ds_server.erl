@@ -26,13 +26,15 @@
 
 -export([dnsxd_admin_zone_list/0, dnsxd_admin_get_zone/1,
 	 dnsxd_admin_change_zone/2, dnsxd_dns_update/6,
-	 dnsxd_reload_zones/1]).
+	 dnsxd_reload_zones/1, dnsxd_allow_axfr/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
 	 terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
+
+-define(TAB_AXFR, dnsxd_couch_axfr).
 
 -define(CHANGES_FILTER, <<?DNSXD_COUCH_DESIGNDOC "/dnsxd_couch_zone">>).
 
@@ -82,38 +84,31 @@ dnsxd_admin_change_zone(ZoneName, [_|_] = Changes) when is_binary(ZoneName) ->
     dnsxd_couch_zone:change(ZoneName, Changes).
 
 dnsxd_reload_zones(ZoneNames) ->
-    FailFun = fun(ZoneName, Reason) ->
-		      Fmt = "Failed to reload ~s after DB failure:~n~p",
-		      ?DNSXD_ERR(Fmt, [ZoneName, Reason]),
-		      ok = dnsxd:delete_zone(ZoneName),
-		      gen_server:cast(?SERVER, {reload, ZoneName})
-	      end,
-    case dnsxd_couch_lib:get_db() of
-	{ok, DbRef} ->
-	    Fun = fun(ZoneName) ->
-			  case dnsxd_couch_zone:get(DbRef, ZoneName) of
-			      {ok, #dnsxd_couch_zone{enabled = true} = Zone} ->
-				  ok = insert_zone(Zone);
-			      {ok, #dnsxd_couch_zone{enabled = false}} ->
-				  ok = dnsxd:delete_zone(ZoneName);
-			      {error, Reason} when Reason =:= deleted orelse
-						   Reason =:= not_found orelse
-						   Reason =:= not_zone ->
-				  ok = dnsxd:delete_zone(ZoneName);
-			      {error, Reason} -> FailFun(ZoneName, Reason)
-			  end
-		  end,
-	    lists:foreach(Fun, ZoneNames);
-	{error, Reason} ->
-	    [ FailFun(ZoneName, Reason) || ZoneName <- ZoneNames ]
-    end,
-    ok.
+    Fun = fun(ZoneName) ->
+		  case load_zone(ZoneName) of
+		      ok -> ok;
+		      {error, Reason} ->
+			  Fmt = "Failed to reload ~s - DB error:~n~p",
+			  ?DNSXD_ERR(Fmt, [ZoneName, Reason]),
+			  gen_server:cast(?SERVER, {reload, ZoneName})
+		  end
+	  end,
+    lists:foreach(Fun, ZoneNames).
+
+dnsxd_allow_axfr(Context, ZoneName) ->
+    case ets:lookup_element(?TAB_AXFR, ZoneName, 2) of
+	Bool when is_boolean(Bool) -> Bool;
+	IPs when is_list(IPs) ->
+	    SrcIP = dnsxd_lib:ip_to_txt(dnsxd_op_ctx:src_ip(Context)),
+	    lists:member(SrcIP, IPs)
+    end.
 
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
 init([]) ->
+    ?TAB_AXFR = ets:new(?TAB_AXFR, [named_table, {keypos, 1}]),
     {ok, DbRef, DbSeq} = dnsxd_couch_lib:setup_monitor(?CHANGES_FILTER),
     State = #state{db_ref = DbRef, db_seq = DbSeq},
     ok = init_load_zones(),
@@ -169,25 +164,12 @@ handle_info({change, Ref, {Props}}, #state{db_ref = Ref} = State) ->
     NewSeq = proplists:get_value(<<"seq">>, Props),
     NewState = State#state{db_seq = NewSeq},
     Exists = dnsxd:zone_loaded(Name),
-    Message = case load_zone(Name) of
-		  {error, not_zone} ->
-		      dnsxd:delete_zone(Name),
-		      "Doc ~s is not a zone.";
-		  {error, not_found} ->
-		      dnsxd:delete_zone(Name),
-		      "Zone ~s deleted.";
-		  {error, deleted} ->
-		      dnsxd:delete_zone(Name),
-		      "Zone ~s deleted.";
-		  {error, disabled} ->
-		      dnsxd:delete_zone(Name),
-		      "Zone ~s disabled.";
-		  ok when Exists ->
-		      "Zone ~s reloaded.";
-		  ok ->
-		      "Zone ~s loaded."
-	      end,
-    ?DNSXD_INFO(Message, [Name]),
+    case load_zone(Name) of
+	ok when Exists -> ?DNSXD_INFO("Zone ~s reloaded", [Name]);
+	ok -> ?DNSXD_INFO("Zone loaded", [Name]);
+	{error, Reason} ->
+	    ?DNSXD_ERR("Failed to load zone ~s: ~p", [Name, Reason])
+    end,
     {noreply, NewState};
 handle_info(_Msg, State) -> {stop, stray_message, State}.
 
@@ -201,14 +183,35 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 
 load_zone(ZoneName) ->
     case dnsxd_couch_zone:get(ZoneName) of
-	{ok, #dnsxd_couch_zone{} = Zone} -> insert_zone(Zone);
-	{error, _Reason} = Error -> Error
+	{ok, #dnsxd_couch_zone{enabled = true} = CouchZone} ->
+	    Zone = to_dnsxd_zone(CouchZone),
+	    ok = dnsxd:reload_zone(Zone),
+	    ok = cache_axfr(CouchZone);
+	{ok, #dnsxd_couch_zone{enabled = false}} ->
+	    ok = unload_zone(ZoneName),
+	    {error, disabled};
+	{error, Reason} = Error ->
+	    case lists:member(Reason, [deleted, not_found, not_zone]) of
+		true -> ok = unload_zone(ZoneName);
+		false -> ok
+	    end,
+	    Error
     end.
 
-insert_zone(#dnsxd_couch_zone{enabled = true} = CouchZone) ->
-    Zone = to_dnsxd_zone(CouchZone),
-    dnsxd:reload_zone(Zone);
-insert_zone(#dnsxd_couch_zone{enabled = false}) -> {error, disabled}.
+cache_axfr(#dnsxd_couch_zone{name = Zone, axfr_enabled = false}) ->
+    ets:insert(?TAB_AXFR, {Zone, false}),
+    ok;
+cache_axfr(#dnsxd_couch_zone{name = Zone, axfr_hosts = []}) ->
+    ets:insert(?TAB_AXFR, {Zone, true}),
+    ok;
+cache_axfr(#dnsxd_couch_zone{name = Zone, axfr_hosts = Hosts}) ->
+    ets:insert(?TAB_AXFR, {Zone, Hosts}),
+    ok.
+
+unload_zone(ZoneName) ->
+    ok = dnsxd:delete_zone(ZoneName),
+    true = ets:delete(?TAB_AXFR, ZoneName),
+    ok.
 
 update_zone_int(Attempts, MsgCtx, Key, ZoneName, PreReqs, Updates) ->
     LockId = {{?MODULE, ZoneName}, self()},
@@ -241,13 +244,7 @@ init_load_zones() ->
     ViewName = {?DNSXD_COUCH_DESIGNDOC, "dnsxd_couch_zone"},
     Fun = fun({Props}) ->
 		  ZoneName = get_value(<<"id">>, Props),
-		  case dnsxd_couch_zone:get(DbRef, ZoneName) of
-		      {ok, #dnsxd_couch_zone{enabled = true} = Zone} ->
-			  ok = insert_zone(Zone);
-		      {ok, #dnsxd_couch_zone{enabled = false}} -> ok;
-		      {error, deleted} -> ok;
-		      {error, not_zone} -> ok
-		  end
+		  load_zone(ZoneName)
 	  end,
     Opts = [{<<"key">>, <<"true">>}],
     ok = couchbeam_view:foreach(Fun, DbRef, ViewName, Opts).
@@ -281,8 +278,6 @@ to_dnsxd_zone(#dnsxd_couch_zone{} = Zone) -> to_dnsxd_zone(Zone, false).
 to_dnsxd_zone(#dnsxd_couch_zone{name = Name,
 				enabled = Enabled,
 				rr = CouchRRs,
-				axfr_enabled = AXFREnabled,
-				axfr_hosts = AXFRHosts,
 				tsig_keys = CouchTSIGKeys,
 				soa_param = CouchSP,
 				dnssec_enabled = DNSSEC,
@@ -320,8 +315,6 @@ to_dnsxd_zone(#dnsxd_couch_zone{name = Name,
 		enabled = Enabled,
 		rr = RRs,
 		serials = Serials,
-		axfr_enabled = AXFREnabled,
-		axfr_hosts = AXFRHosts,
 		tsig_keys = TSIGKeys,
 		soa_param = SP,
 		dnssec_enabled = DNSSEC,

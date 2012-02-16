@@ -35,7 +35,10 @@ handle(MsgCtx, #dns_message{
     SrcIP = dnsxd_lib:ip_to_txt(SrcIPTuple),
     Refuse = if Protocol =:= udp -> true;
 		ZoneRef =:= undefined -> true;
-		true -> not allow(ZoneRef, SrcIP) end,
+		true ->
+		     Datastore = dnsxd:datastore(),
+		     not Datastore:dnsxd_allow_axfr(MsgCtx, ZoneName)
+	     end,
     MsgArgs = [ZoneName, SrcIP, SrcPort],
     Props = case Refuse of
 		true ->
@@ -51,12 +54,6 @@ handle(MsgCtx, #dns_message{
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
-
-allow(Zone, SrcIP) ->
-    case dnsxd_ds_server:axfr_hosts(Zone) of
-	Bool when is_boolean(Bool) -> Bool;
-	Hosts when is_list(Hosts) -> lists:member(SrcIP, Hosts)
-    end.
 
 sets(ZoneRef) ->
     Sets = dnsxd_ds_server:get_all_sets(ZoneRef),

@@ -51,7 +51,7 @@
 -export([load_zone/1, reload_zone/1, delete_zone/1, zone_loaded/1]).
 
 %% querying
--export([find_zone/1, is_dnssec_zone/1, axfr_hosts/1, lookup_rrname/2,
+-export([find_zone/1, is_dnssec_zone/1, lookup_rrname/2,
 	 is_cut/2, lookup_sets/4, get_set/3, get_all_sets/1, get_key/1,
 	 zonename_from_ref/1, get_nsec3_cover/2, get_zone/1, next_serial/1]).
 
@@ -93,11 +93,6 @@ is_dnssec_zone(#serial_ref{zone_ref = Ref}) -> is_dnssec_zone(Ref);
 is_dnssec_zone(#zone_ref{name = Name}) ->
     Labels = dns:dname_to_labels(Name),
     undefined =/= ets:lookup_element(?TAB_ZONE, Labels, #zone.nsec3).
-
-axfr_hosts(#serial_ref{zone_ref = ZoneRef}) -> axfr_hosts(ZoneRef);
-axfr_hosts(#zone_ref{name = Name}) ->
-    Labels = dns:dname_to_labels(Name),
-    ets:lookup_element(?TAB_ZONE, Labels, #zone.axfr).
 
 get_key(FQKeyName) ->
     case fqkn_to_key_and_zonename(FQKeyName) of
@@ -423,12 +418,12 @@ insert_zone(#dnsxd_zone{name = ZoneName} = Zone) when is_binary(ZoneName) ->
     TempTab = ets:new(dnsxd_tmp_lz, [public, duplicate_bag]),
     Ref = make_ref(),
     case dnsxd_zone:prepare(TempTab, Ref, #dnsxd_zone{} = Zone) of
-	{ok, Serials, SOA, NSEC3, AXFR} ->
+	{ok, Serials, SOA, NSEC3} ->
 	    if FailedPreviously -> ets:delete(?TAB_BADZONE, ZoneName);
 	       true -> ok end,
 	    ok = insert_from_temp_tab(TempTab),
 	    true = ets:delete(TempTab),
-	    ok = add_to_zone_tab(ZoneName, Ref, Serials, AXFR, SOA, NSEC3),
+	    ok = add_to_zone_tab(ZoneName, Ref, Serials, SOA, NSEC3),
 	    ok = add_reload_entry(ZoneName, Serials),
 	    ok = dnsxd_llq_manager:zone_changed(ZoneName);
 	{error, Reason} ->
@@ -445,7 +440,7 @@ insert_zone(#dnsxd_zone{name = ZoneName} = Zone) when is_binary(ZoneName) ->
 	    {error, bad_zone}
     end.
 
-add_to_zone_tab(ZoneName, Ref, Serials, AXFR, #dnsxd_soa_param{} = SOA, NSEC3)
+add_to_zone_tab(ZoneName, Ref, Serials, #dnsxd_soa_param{} = SOA, NSEC3)
   when is_record(NSEC3, dnsxd_nsec3_param) orelse NSEC3 =:= undefined ->
     ZoneNameLabels = dns:dname_to_labels(ZoneName),
     NewZone = #zone{labels = ZoneNameLabels,
@@ -453,7 +448,6 @@ add_to_zone_tab(ZoneName, Ref, Serials, AXFR, #dnsxd_soa_param{} = SOA, NSEC3)
 		    soa = SOA,
 		    ref = Ref,
 		    serials = Serials,
-		    axfr = AXFR,
 		    nsec3 = NSEC3},
     case ets:lookup(?TAB_ZONE, ZoneNameLabels) of
 	[#zone{name = undefined, cuts = Cuts}] ->

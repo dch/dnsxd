@@ -38,9 +38,9 @@ prepare(TempTab, Ref, #dnsxd_zone{} = Zone) ->
 
 receive_result(Pid, Ref) ->
     receive
-	{Pid, Ref, Serials, SOA, NSEC3, AXFR} ->
+	{Pid, Ref, Serials, SOA, NSEC3} ->
 	    receive
-		{'EXIT', Pid, 'normal'} -> {ok, Serials, SOA, NSEC3, AXFR};
+		{'EXIT', Pid, 'normal'} -> {ok, Serials, SOA, NSEC3};
 		{'EXIT', Pid, Reason} -> {error, Reason}
 	    end;
 	{'EXIT', Pid, Reason} -> {error, Reason}
@@ -59,10 +59,9 @@ main(Parent, TempTab, Ref, #dnsxd_zone{name = ZoneName} = Zone) ->
     TSIG = #tsig{zone_ref = ZoneRef, keys = TSIGKeys},
     ets:insert(TempTab, TSIG),
     Serials = get_serials_to_prep(Zone0),
-    AXFR = axfr_settings(Zone0),
     ok = main(TempTab, [], WorkerLimit, Serials, Ref, Zone0),
     RealSerials = lists:reverse(tl(lists:reverse(Serials))),
-    Parent ! {self(), Ref, RealSerials, SOA, NSEC3, AXFR}.
+    Parent ! {self(), Ref, RealSerials, SOA, NSEC3}.
 
 main(TempTab, Workers, Limit, [Serial|[NextSerial|_] = Serials], Ref, Zone)
   when length(Workers) < Limit ->
@@ -262,10 +261,6 @@ get_serials_to_prep(_Serials, Now, _Max, _MinTime, [Serial]) ->
     [Serial, Now + ?YEAR_SECONDS];
 get_serials_to_prep(_Serials, _Now, _Max, _MinTime, Collected) ->
     lists:reverse(Collected).
-
-axfr_settings(#dnsxd_zone{axfr_enabled = false}) -> false;
-axfr_settings(#dnsxd_zone{axfr_enabled = true, axfr_hosts = []}) -> true;
-axfr_settings(#dnsxd_zone{axfr_enabled = true, axfr_hosts = Hosts}) -> Hosts.
 
 prep_zone(Parent, TempTab, Serial, NextSerial, Ref,
 	  #dnsxd_zone{name = ZoneName,

@@ -3,7 +3,7 @@
 
 -export([all/0, init_per_testcase/2, end_per_testcase/2]).
 
--export([accept/1, refuse1/1, refuse2/1]).
+-export([accept/1, refuse/1]).
 
 all() -> ?arity1_exports.
 
@@ -16,9 +16,7 @@ rr(Config) ->
 
 init_per_testcase(TestCase, Config) ->
     Config0 = rr([{transport, tcp},
-		  {axfr_disabled, TestCase =:= refuse1},
-		  {axfr_hosts, if TestCase =:= refuse2 -> [<<"127.0.0.2">>];
-				  true -> [] end}|Config]),
+		  {axfr_disabled, TestCase =:= refuse}|Config]),
     ?testcase_init(Config0).
 
 end_per_testcase(_TestCase, Config) -> ok = ?testcase_end(Config).
@@ -41,7 +39,7 @@ accept(Config) ->
     #dns_rr{type = ?DNS_TYPE_SOA} = hd(lists:reverse(Tail)),
     ok.
 
-refuse1(Config) ->
+refuse(Config) ->
     QMsg = #dns_message{qc = 1,
 			questions = [#dns_query{name = <<"example">>,
 						class = ?DNS_CLASS_IN,
@@ -49,5 +47,3 @@ refuse1(Config) ->
     RMsg = #dns_message{id = QMsg#dns_message.id, qr = true,
 			rc = ?DNS_RCODE_REFUSED, _ = '_'},
     ?match_response(Config, QMsg, RMsg).
-
-refuse2(Config) -> refuse1(Config).

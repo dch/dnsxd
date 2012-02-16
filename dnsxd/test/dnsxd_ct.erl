@@ -1,11 +1,18 @@
 -module(dnsxd_ct).
 -include("dnsxd_ct.hrl").
+
+-export([dnsxd_allow_axfr/2]).
 -export([testcase_init/1, testcase_end/1]).
 -export([gen_ms_rr/2, send/2, match_message/2, match_response/3]).
 
 -define(SERVER_PORT, 5533).
 
+dnsxd_allow_axfr(_,_) ->
+    {ok, Allow} = dnsxd:get_env(ct_allow_axfr),
+    Allow.
+
 testcase_init(Config) ->
+    AllowAXFR = not proplists:get_bool(axfr_disabled, Config),
     Transport = proplists:get_value(transport, Config, udp),
     Config0 = ?update_pl(transport, Transport, Config),
     IPStr = proplists:get_value(ip, Config0, "::1"),
@@ -13,6 +20,7 @@ testcase_init(Config) ->
     lists:foreach(fun({K, V}) -> ok = application:set_env(dnsxd, K, V) end,
 		  [{datastore_mod, ?MODULE},
 		   {log_mod, ?MODULE},
+		   {ct_allow_axfr, AllowAXFR},
 		   {interfaces, [{IPStr, ?SERVER_PORT, Transport}]}]),
     ok = dnsxd:start(),
     {ok, IP} = inet_parse:address(IPStr),
@@ -79,9 +87,6 @@ generate_zone(Config) ->
       expire = proplists:get_value(expire, SOAOpts, 3600000),
       minimum = proplists:get_value(minimum, SOAOpts, 3600)
      },
-    AXFREnabled = not proplists:get_bool(axfr_disabled, Config),
-    AXFRHosts = if AXFREnabled -> proplists:get_value(axfr_hosts, Config, []);
-		   true -> [] end,
     DNSSECSigLife = proplists:get_value(dnssec_siglife, Config, 1250000),
     NSEC3Opts = proplists:get_value(nsec3, Config, []),
     NSEC3Param = #dnsxd_nsec3_param{
@@ -94,8 +99,6 @@ generate_zone(Config) ->
 		       enabled = true,
 		       rr = prepare_rr(RR, Config0),
 		       serials = undefined,
-		       axfr_enabled = AXFREnabled,
-		       axfr_hosts = AXFRHosts,
 		       tsig_keys = [],
 		       soa_param = SOAParam,
 		       dnssec_enabled = false,

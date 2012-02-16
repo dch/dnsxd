@@ -19,8 +19,6 @@
 		     enabled = false,
 		     rr,
 		     serials,
-		     axfr_enabled,
-		     axfr_hosts,
 		     tsig_keys = [],
 		     soa_param,
 		     dnssec_enabled = false,

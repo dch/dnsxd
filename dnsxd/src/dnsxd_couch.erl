@@ -26,7 +26,7 @@
 
 -export([dnsxd_admin_zone_list/0, dnsxd_admin_get_zone/1,
 	 dnsxd_admin_change_zone/2, dnsxd_dns_update/6, dnsxd_log/1,
-	 dnsxd_reload_zones/1]).
+	 dnsxd_reload_zones/1, dnsxd_allow_axfr/2]).
 
 %% Supervisor callbacks
 -export([init/1]).
@@ -60,6 +60,9 @@ dnsxd_log(Props) -> dnsxd_couch_log_server:dnsxd_log(Props).
 
 dnsxd_reload_zones(ZoneNames) ->
     dnsxd_couch_ds_server:dnsxd_reload_zones(ZoneNames).
+
+dnsxd_allow_axfr(MsgCtx, ZoneName) ->
+    dnsxd_couch_ds_server:dnsxd_allow_axfr(MsgCtx, ZoneName).
 
 %%%===================================================================
 %%% Supervisor callbacks
