@@ -86,17 +86,16 @@ put(DbRef, #dnsxd_couch_zone{} = Zone) ->
 	{error, _Reason} = Error -> Error
     end.
 
-update(_MsgCtx, Key, ZoneName, PreReqs, Updates) ->
+update(Key, ZoneName, Lease, PreReq, Changes) when is_binary(Key) ->
     case ?MODULE:get(ZoneName) of
 	{ok, #dnsxd_couch_zone{enabled = true} = Zone} ->
-	    update(Zone, Key, PreReqs, Updates);
+	    update(Zone, Key, Lease, PreReq, Changes);
 	{ok, #dnsxd_couch_zone{enabled = false}} ->
 	    {error, disabled};
 	{error, _Reason} = Error -> Error
-    end.
-
+    end;
 update(#dnsxd_couch_zone{rr = RRs, tombstone_period = TombstonePeriod} = Zone,
-       Key, PreReqs, Updates) ->
+       Key, Lease, PreReqs, Updates) ->
     Now = dns:unix_time(),
     {MutableRRs, ImmutableRRs} = lists:partition(
 				   fun(#dnsxd_couch_rr{tombstone = Int})
@@ -112,18 +111,15 @@ update(#dnsxd_couch_zone{rr = RRs, tombstone_period = TombstonePeriod} = Zone,
 				   end, RRs),
     case check_update_prereqs(PreReqs, MutableRRs) of
 	ok ->
-	    NewMutableRRs = update_rr(Key, Updates, MutableRRs),
+	    NewMutableRRs = update_rr(Key, Lease, Updates, MutableRRs),
 	    NewImmutableRRs = reap(Now, TombstonePeriod, ImmutableRRs),
 	    NewRRs = lists:sort(NewMutableRRs ++ NewImmutableRRs),
 	    NewZone = Zone#dnsxd_couch_zone{rr = NewRRs},
 	    case put(NewZone) of
-		ok ->
-		    {ok, ?DNS_RCODE_NOERROR};
-		{error, _Reason} = Error ->
-		    timer:sleep(50),
-		    Error
+		ok -> {ok, Lease};
+		{error, _Reason} = Error -> Error
 	    end;
-	Rcode when is_atom(Rcode) -> {ok, Rcode}
+	{error, RC} when is_integer(RC) -> RC
     end.
 
 change(ZoneName, Changes) ->
@@ -485,70 +481,67 @@ is_active_test_() ->
 %%%===================================================================
 
 check_update_prereqs([], _RRs) -> ok;
-check_update_prereqs([{exist, NameM}|PreReqs], RRs) ->
-    Name = dns:dname_to_lower(NameM),
+check_update_prereqs([{exist, Name}|PreReqs], RRs) when is_binary(Name) ->
     Exists = lists:keymember(Name, #dnsxd_couch_rr.name, RRs),
     if Exists -> check_update_prereqs(PreReqs, RRs);
-       true -> nxdomain end;
-check_update_prereqs([{exist, NameM, Type}|PreReqs], RRs) ->
-    Name = dns:dname_to_lower(NameM),
+       true -> {error, ?DNS_RCODE_NXDOMAIN} end;
+check_update_prereqs([{exist, {Name, Type}}|PreReqs], RRs) ->
     Exists = lists:any(fun(#dnsxd_couch_rr{name = SN, type = ST}) ->
-		       Name =:= SN andalso Type =:= ST end, RRs),
+			       Name =:= SN andalso Type =:= ST end, RRs),
     if Exists -> check_update_prereqs(PreReqs, RRs);
-       true -> nxrrset end;
-check_update_prereqs([{exist, NameM, Type, Data}|PreReqs], RRs) ->
-    Name = dns:dname_to_lower(NameM),
+       true -> {error, ?DNS_RCODE_NXRRSET} end;
+check_update_prereqs([{exist, {Name, Type, Data}}|PreReqs], RRs) ->
     Exists = lists:any(fun(#dnsxd_couch_rr{name = SN, type = ST, data = SD}) ->
 			       (Name =:= SN andalso Type =:= ST andalso
 				Data =:= SD) %% parenthesis for emacs' benefit
 		       end, RRs),
     if Exists -> check_update_prereqs(PreReqs, RRs);
-       true -> nxrrset end;
-check_update_prereqs([{not_exist, NameM}|PreReqs], RRs) ->
-    Name = dns:dname_to_lower(NameM),
+       true -> {error, ?DNS_RCODE_NXRRSET} end;
+check_update_prereqs([{not_exist, Name}|PreReqs], RRs) when is_binary(Name) ->
     Exists = lists:keymember(Name, #dnsxd_couch_rr.name, RRs),
-    if Exists -> yxdomain;
+    if Exists -> {error, ?DNS_RCODE_YXDOMAIN};
        true -> check_update_prereqs(PreReqs, RRs) end;
-check_update_prereqs([{not_exist, NameM, Type}|PreReqs], RRs) ->
-    Name = dns:dname_to_lower(NameM),
+check_update_prereqs([{not_exist, {Name, Type}}|PreReqs], RRs) ->
     Exists = lists:any(fun(#dnsxd_couch_rr{name = SN, type = ST}) ->
-		       Name =:= SN andalso Type =:= ST end, RRs),
-    if Exists -> yxrrset;
+			       Name =:= SN andalso Type =:= ST end, RRs),
+    if Exists -> {error, ?DNS_RCODE_YXRRSET};
        true -> check_update_prereqs(PreReqs, RRs) end.
 
 -ifdef(TEST).
 
 check_update_prereqs_test_() ->
-    Cases = [{nxdomain, [{exist, <<$a>>}], []},
+    Cases = [{{error, ?DNS_RCODE_NXDOMAIN}, [{exist, <<$a>>}], []},
 	     {ok, [{exist, <<$a>>}], [#dnsxd_couch_rr{name = <<$a>>}]},
-	     {nxrrset, [{exist, <<$a>>, 1}], [#dnsxd_couch_rr{name = <<$a>>}]},
-	     {ok, [{exist, <<$a>>, 1}],
+	     {{error, ?DNS_RCODE_NXRRSET}, [{exist, {<<$a>>, 1}}],
+	      [#dnsxd_couch_rr{name = <<$a>>}]},
+	     {ok, [{exist, {<<$a>>, 1}}],
 	      [#dnsxd_couch_rr{name = <<$a>>, type = 1}]},
-	     {nxrrset, [{exist, <<$a>>, 1, <<$a>>}],
+	     {{error, ?DNS_RCODE_NXRRSET}, [{exist, {<<$a>>, 1, <<$a>>}}],
 	      [#dnsxd_couch_rr{name = <<$a>>, type = 1}]},
-	     {ok, [{exist, <<$a>>, 1, <<$a>>}],
+	     {ok, [{exist, {<<$a>>, 1, <<$a>>}}],
 	      [#dnsxd_couch_rr{name = <<$a>>, type = 1, data = <<$a>>}]},
-	     {yxdomain, [{not_exist, <<$a>>}],
+	     {{error, ?DNS_RCODE_YXDOMAIN}, [{not_exist, <<$a>>}],
 	      [#dnsxd_couch_rr{name = <<$a>>}]},
 	     {ok, [{not_exist, <<$a>>}], []},
-	     {yxrrset, [{not_exist, <<$a>>, 1}],
+	     {{error, ?DNS_RCODE_YXRRSET}, [{not_exist, {<<$a>>, 1}}],
 	      [#dnsxd_couch_rr{name = <<$a>>, type = 1}]},
-	     {ok, [{not_exist, <<$a>>, 1}], [#dnsxd_couch_rr{name = <<$a>>}]}],
+	     {ok, [{not_exist, {<<$a>>, 1}}],
+	      [#dnsxd_couch_rr{name = <<$a>>}]}],
     [ ?_assertEqual(Result, check_update_prereqs(PreReq, RR))
-      || {Result, PreReq, RR} <- Cases ].
+	  || {Result, PreReq, RR} <- Cases ].
 
 -endif.
 
-update_rr(_Key, [], RRs) -> RRs;
-update_rr(Key, [{delete, Name}|Updates], RRs) ->
+update_rr(_Key, _Lease, [], RRs) -> RRs;
+update_rr(Key, Lease, [{delete, Name}|Updates], RRs) when is_binary(Name) ->
     Now = dns:unix_time(),
     {Match, Diff} = lists:partition(
 		      fun(#dnsxd_couch_rr{name = SN}) ->
 			      dns:dname_to_lower(SN) =:= Name end, RRs),
     NewMatch = [ RR#dnsxd_couch_rr{expire = Now - 1} || RR <- Match ],
     NewRRs = NewMatch ++ Diff,
-    update_rr(Key, Updates, NewRRs);
-update_rr(Key, [{delete, Name, Type}|Updates], RRs) ->
+    update_rr(Key, Lease, Updates, NewRRs);
+update_rr(Key, Lease, [{delete, {Name, Type}}|Updates], RRs) ->
     Now = dns:unix_time(),
     Fun = fun(#dnsxd_couch_rr{name = SN, type = ST}) ->
 		  dns:dname_to_lower(SN) =:= Name andalso ST =:= Type
@@ -556,8 +549,8 @@ update_rr(Key, [{delete, Name, Type}|Updates], RRs) ->
     {Match, Diff} = lists:partition(Fun, RRs),
     NewMatch = [ RR#dnsxd_couch_rr{expire = Now - 1} || RR <- Match ],
     NewRRs = NewMatch ++ Diff,
-    update_rr(Key, Updates, NewRRs);
-update_rr(Key, [{delete, Name, Type, Data}|Updates], RRs) ->
+    update_rr(Key, Lease, Updates, NewRRs);
+update_rr(Key, Lease, [{delete, {Name, Type, Data}}|Updates], RRs) ->
     Now = dns:unix_time(),
     Fun = fun(#dnsxd_couch_rr{name = SN, type = ST, data = SD}) ->
 		  (dns:dname_to_lower(SN) =:= Name andalso
@@ -566,16 +559,16 @@ update_rr(Key, [{delete, Name, Type, Data}|Updates], RRs) ->
     {Match, Diff} = lists:partition(Fun, RRs),
     NewMatch = [ RR#dnsxd_couch_rr{expire = Now - 1} || RR <- Match ],
     NewRRs = NewMatch ++ Diff,
-    update_rr(Key, Updates, NewRRs);
-update_rr(Key, [{add, Name, Type, TTL, Data, LeaseLength}|Updates], RRs) ->
+    update_rr(Key, Lease, Updates, NewRRs);
+update_rr(Key, Lease, [{add, {Name, Type, TTL, Data}}|Updates], RRs) ->
     Fun = fun(#dnsxd_couch_rr{name = SN, type = ST, data = SD}) ->
 		  (dns:dname_to_lower(SN) =:= Name
 		   andalso Type =:= ST andalso SD =:= Data)
 	  end,
     {Match, Diff} = lists:partition(Fun, RRs),
     Now = dns:unix_time(),
-    Expire = case is_integer(LeaseLength) andalso LeaseLength > 0 of
-		 true -> Now + LeaseLength;
+    Expire = case is_integer(Lease) andalso Lease > 0 of
+		 true -> Now + Lease;
 		 false -> undefined
 	     end,
     case Match of
@@ -584,17 +577,17 @@ update_rr(Key, [{add, Name, Type, TTL, Data, LeaseLength}|Updates], RRs) ->
 				    type = Type, ttl = TTL, data = Data,
 				    incept = Now, expire = Expire},
 	    NewRRs = [NewRR|RRs],
-	    update_rr(Key, Updates, NewRRs);
+	    update_rr(Key, Lease, Updates, NewRRs);
 	[#dnsxd_couch_rr{} = RR] ->
 	    NewRR = RR#dnsxd_couch_rr{ttl = TTL, set = Now, expire = Expire},
 	    NewRRs = [NewRR|Diff],
-	    update_rr(Key, Updates, NewRRs);
+	    update_rr(Key, Lease, Updates, NewRRs);
 	[#dnsxd_couch_rr{} = RR|Dupes] ->
 	    NewRR = RR#dnsxd_couch_rr{ttl = TTL, set = Now, expire = Expire},
 	    NewDupes = [ Dupe#dnsxd_couch_rr{expire = Now - 1}
 			 || Dupe <- Dupes ],
 	    NewRRs = NewDupes ++ [NewRR|Diff],
-	    update_rr(Key, Updates, NewRRs)
+	    update_rr(Key, Lease, Updates, NewRRs)
     end.
 
 -ifdef(TEST).
@@ -603,103 +596,106 @@ update_rr(Key, [{add, Name, Type, TTL, Data, LeaseLength}|Updates], RRs) ->
 
 update_rr_delete_1_test() ->
     Key = undefined,
+    Lease = undefined,
     Update = {delete, <<$a>>},
     RRA = #dnsxd_couch_rr{name = <<$a>>},
     RRB = #dnsxd_couch_rr{name = <<$b>>},
     In = [RRA, RRB],
     Out = [RRA#dnsxd_couch_rr{expire = dns:unix_time() - 1}, RRB],
-    ?assertEqual(Out, update_rr(Key, [Update], In)).
+    ?assertEqual(Out, update_rr(Key, Lease, [Update], In)).
 
 update_rr_delete_2_test() ->
     Key = undefined,
-    Update = {delete, <<$a>>, 1},
+    Lease = undefined,
+    Update = {delete, {<<$a>>, 1}},
     RRA = #dnsxd_couch_rr{name = <<$a>>, type = 1},
     RRB = #dnsxd_couch_rr{name = <<$b>>, type = 1},
     In = [RRA, RRB],
     Out = [RRA#dnsxd_couch_rr{expire = dns:unix_time() - 1}, RRB],
-    ?assertEqual(Out, update_rr(Key, [Update], In)).
+    ?assertEqual(Out, update_rr(Key, Lease, [Update], In)).
 
 update_rr_delete_3_test() ->
     Key = undefined,
-    Update = {delete, <<$a>>, 1, <<$a>>},
+    Lease = undefined,
+    Update = {delete, {<<$a>>, 1, <<$a>>}},
     RRA = #dnsxd_couch_rr{name = <<$a>>, type = 1, data = <<$a>>},
     RRB = #dnsxd_couch_rr{name = <<$a>>, type = 1, data = <<$b>>},
     In = [RRA, RRB],
     Out = [RRA#dnsxd_couch_rr{expire = dns:unix_time() - 1}, RRB],
-    ?assertEqual(Out, update_rr(Key, [Update], In)).
+    ?assertEqual(Out, update_rr(Key, Lease, [Update], In)).
 
 update_rr_add_1_test() ->
     Key = undefined,
+    Lease = 3,
     Name = <<$a>>,
     Type = 1,
     TTL = 2,
     Data = <<$a>>,
-    LeaseLength = 3,
     Now = dns:unix_time(),
-    Update = {add, Name, Type, TTL, Data, LeaseLength},
+    Update = {add, {Name, Type, TTL, Data}},
     Out = [#dnsxd_couch_rr{id = undefined, name = Name, class = ?DNS_CLASS_IN,
 			   type = Type, ttl = TTL, data = Data, incept = Now,
-			   expire = Now + LeaseLength}],
+			   expire = Now + Lease}],
     Fun = fun() ->
 		  [ RR#dnsxd_couch_rr{id = undefined}
-		    || RR <- update_rr(Key, [Update], []) ]
+		    || RR <- update_rr(Key, Lease, [Update], []) ]
 	  end,
     ?assertEqual(Out, Fun()).
 
 update_rr_add_2_test() ->
     Key = undefined,
+    Lease = undefined,
     Name = <<$a>>,
     Type = 1,
     TTL = 2,
     Data = <<$a>>,
-    LeaseLength = undefined,
     Now = dns:unix_time(),
-    Update = {add, Name, Type, TTL, Data, LeaseLength},
+    Update = {add, {Name, Type, TTL, Data}},
     Out = [#dnsxd_couch_rr{id = undefined, name = Name, class = ?DNS_CLASS_IN,
 			   type = Type, ttl = TTL, data = Data, incept = Now,
 			   expire = undefined}],
     Fun = fun() ->
 		  [ RR#dnsxd_couch_rr{id = undefined}
-		    || RR <- update_rr(Key, [Update], []) ]
+		    || RR <- update_rr(Key, Lease, [Update], []) ]
 	  end,
     ?assertEqual(Out, Fun()).
 
 update_rr_add_3_test() ->
     Key = undefined,
+    Lease = 3,
     Name = <<$a>>,
     Type = 1,
     TTL = 2,
     Data = <<$a>>,
-    LeaseLength = 3,
     Now = dns:unix_time(),
-    Update = {add, Name, Type, TTL, Data, LeaseLength},
+    Update = {add, {Name, Type, TTL, Data}},
     RRA = #dnsxd_couch_rr{name = Name, class = ?DNS_CLASS_IN, type = Type,
 			  ttl = TTL, data = Data, incept = Now,
 			  expire = Now + 3600},
-    RRB = RRA#dnsxd_couch_rr{set = Now, expire = Now + LeaseLength},
+    RRB = RRA#dnsxd_couch_rr{set = Now, expire = Now + Lease},
     Out = [RRB],
-    ?assertEqual(Out, update_rr(Key, [Update], [RRA])).
+    ?assertEqual(Out, update_rr(Key, Lease, [Update], [RRA])).
 
 update_rr_add_4_test() ->
     Key = undefined,
+    Lease = 3,
     Name = <<$a>>,
     Type = 1,
     TTL = 2,
     Data = <<$a>>,
-    LeaseLength = 3,
     Now = dns:unix_time(),
-    Update = {add, Name, Type, TTL, Data, LeaseLength},
+    Update = {add, {Name, Type, TTL, Data}},
     RRA1 = #dnsxd_couch_rr{name = Name, class = ?DNS_CLASS_IN, type = Type,
 			   ttl = TTL, data = Data, incept = Now,
 			   expire = Now + 3600},
-    RRA2 = RRA1#dnsxd_couch_rr{set = Now, expire = Now + LeaseLength},
+    RRA2 = RRA1#dnsxd_couch_rr{set = Now, expire = Now + Lease},
     RRB1 = #dnsxd_couch_rr{name = Name, class = ?DNS_CLASS_IN, type = Type,
 			   ttl = TTL, data = Data, incept = Now,
 			   expire = Now + 3600},
     RRB2 = RRB1#dnsxd_couch_rr{set = Now, expire = Now - 1},
     In = [RRA1, RRB1],
     Out = [RRB2, RRA2],
-    ?assertEqual(Out, update_rr(Key, [Update], In)).
+    ?assertEqual(Out, update_rr(Key, Lease, [Update], In)).
 
 -endif.
 

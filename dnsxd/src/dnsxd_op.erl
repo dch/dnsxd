@@ -84,7 +84,9 @@ handler(#dns_message{oc = ?DNS_OPCODE_QUERY, qc = 1,
 	true -> fun dnsxd_op_llq:handle/2;
 	false -> fun dnsxd_op_query:handle/2
     end;
-handler(#dns_message{oc = ?DNS_OPCODE_UPDATE, qc = 1}) ->
+handler(#dns_message{oc = ?DNS_OPCODE_UPDATE, qc = 1,
+		     questions = [#dns_query{class = ?DNS_CLASS_IN,
+					     type = ?DNS_TYPE_SOA}]}) ->
     fun dnsxd_op_update:handle/2;
 handler(_) -> fun dnsxd_op_notimp:handle/2.
 

@@ -22,7 +22,7 @@
 
 %% API
 -export([ensure_apps_started/1, new_id/0, is_dnssd_rr/2, use_procket/0,
-	 procket_open/4, cancel_timer/1, ip_to_txt/1]).
+	 procket_open/4, cancel_timer/1, ip_to_txt/1, is_dnssd_change/3]).
 
 %%%===================================================================
 %%% API
@@ -91,6 +91,19 @@ is_dnssd_rr_test_() ->
       || {Result, RR} <- CasesAll ].
 
 -endif.
+
+is_dnssd_change(ZoneName, KeyName, {delete, {Name, Type, _Data}}) ->
+    is_dnssd_change(ZoneName, KeyName, {delete, {Name, Type}});
+is_dnssd_change(_ZoneName, KeyName, {delete, {KeyName, _}}) -> true;
+is_dnssd_change(ZoneName, _KeyName, {delete, {Name, Type}}) ->
+    is_dnssd_rr(ZoneName, Name, Type);
+is_dnssd_change(_ZoneName, KeyName, {delete, KeyName}) -> true;
+is_dnssd_change(ZoneName, KeyName, {add, {Name, Type, _TTL, _Data}}) ->
+    case Name of
+	KeyName -> true;
+	_ -> is_dnssd_rr(ZoneName, Name, Type)
+    end;
+is_dnssd_change(_ZoneName, _KeyName, _Change) -> false.
 
 use_procket() ->
     case dnsxd:get_env(procket) of

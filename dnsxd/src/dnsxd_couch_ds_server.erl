@@ -25,7 +25,7 @@
 -export([start_link/0]).
 
 -export([dnsxd_admin_zone_list/0, dnsxd_admin_get_zone/1,
-	 dnsxd_admin_change_zone/2, dnsxd_dns_update/6,
+	 dnsxd_admin_change_zone/2, dnsxd_dns_update/5,
 	 dnsxd_reload_zones/1, dnsxd_allow_axfr/2]).
 
 %% gen_server callbacks
@@ -50,11 +50,13 @@ start_link() ->
     Opts = [{timeout, Timeout}],
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], Opts).
 
-dnsxd_dns_update(MsgCtx, Key, ZoneName, ?DNS_CLASS_IN, PreReqs, Updates) ->
-    DsOpts = dnsxd:datastore_opts(),
-    Attempts = proplists:get_value(update_attempts, DsOpts, 10),
-    update_zone_int(Attempts, MsgCtx, Key, ZoneName, PreReqs, Updates);
-dnsxd_dns_update(_, _, _, _, _, _) -> refused.
+dnsxd_dns_update(MsgCtx, ZoneName, Lease, PreReq, Changes) ->
+    case dnsxd_op_ctx:tsig(MsgCtx) of
+	#dnsxd_tsig_ctx{zonename = ZoneName, keyname = KeyName} ->
+	    {ZoneName, Key} = dnsxd:get_key(KeyName),
+	    update_zone(Key, ZoneName, Lease, PreReq, Changes);
+	_ -> {error, ?DNS_RCODE_NOTAUTH}
+    end.
 
 dnsxd_admin_zone_list() ->
     case dnsxd_couch_lib:get_db() of
@@ -213,30 +215,43 @@ unload_zone(ZoneName) ->
     true = ets:delete(?TAB_AXFR, ZoneName),
     ok.
 
-update_zone_int(Attempts, MsgCtx, Key, ZoneName, PreReqs, Updates) ->
-    LockId = {{?MODULE, ZoneName}, self()},
+update_zone(#dnsxd_tsig_key{dnssd_only = true, name = KeyName},
+	    ZoneName, Lease, PreReq, Changes) ->
+    Fun = fun(Change) ->
+		  dnsxd_lib:is_dnssd_change(ZoneName, KeyName, Change)
+	  end,
+    case lists:all(Fun, Changes) of
+	true -> update_zone(KeyName, ZoneName, Lease, PreReq, Changes);
+	false -> {error, ?DNS_RCODE_REFUSED}
+    end;
+update_zone(#dnsxd_tsig_key{name = KeyName}, ZoneName, Lease, PreReq,
+	    Changes) ->
+    update_zone(KeyName, ZoneName, Lease, PreReq, Changes);
+update_zone(Key, Zone, Lease, PreReq, Changes) ->
+    LockId = {{?MODULE, Zone}, self()},
+    DsOpts = dnsxd:datastore_opts(),
+    Attempts = proplists:get_value(update_attempts, DsOpts, 10),
     BeforeLock = now(),
     true = global:set_lock(LockId, [node()]),
-    F = fun() ->
-		dnsxd_couch_zone:update(MsgCtx, Key, ZoneName, PreReqs, Updates)
-	end,
     Result = case timer:now_diff(now(), BeforeLock) < 2000000 of
-		 true -> update_zone(F, Attempts);
-		 false -> timeout
+		 true ->
+		     update_zone(Attempts, Key, Zone, Lease, PreReq, Changes);
+		 false -> {error, timeout}
 	     end,
     true = global:del_lock(LockId),
     Result.
 
-update_zone(_Fun, 0) -> ?DNS_RCODE_SERVFAIL;
-update_zone(Fun, Attempts) ->
-    NewAttempts = Attempts - 1,
-    case Fun() of
-	{ok, Rcode} -> Rcode;
-	{error, disabled} -> refused;
-	{error, conflict} -> update_zone(Fun, NewAttempts);
-	{error, _Error} ->
-	    %% todo: log the error
-	    update_zone(Fun, NewAttempts)
+update_zone(0, _Key, Zone, _Lease, _PreReq, _Changes) ->
+    ?DNSXD_ERR("Exhausted update attempts updating ~s", [Zone]),
+    {error, ?DNS_RCODE_SERVFAIL};
+update_zone(Attempts, Key, Zone, Lease, PreReq, Changes) ->
+    case dnsxd_couch_zone:update(Key, Zone, Lease, PreReq, Changes) of
+	{error, conflict} ->
+	    update_zone(Attempts - 1, Key, Zone, Lease, PreReq, Changes);
+	{error, Reason} ->
+	    ?DNSXD_ERR("Error updating ~s:~n~p", [Zone, Reason]),
+	    {error, ?DNS_RCODE_SERVFAIL};
+	Other -> Other
     end.
 
 init_load_zones() ->
