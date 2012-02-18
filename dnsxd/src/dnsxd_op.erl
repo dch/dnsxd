@@ -111,23 +111,30 @@ get_tsig(#dns_message{additional = Additional}) ->
 	_ -> undefined
     end.
 
-verify_tsig(MsgCtx, #dns_message{oc = OC} = ReqMsg,
+verify_tsig(MsgCtx, #dns_message{oc = OC,
+				 questions = [#dns_query{name = QNameM} = Q|_]
+				} = ReqMsg,
 	    #dns_rr{name = KeyNameM, data = Data}, ReqMsgBin) ->
     #dns_rrdata_tsig{alg = AlgM, msgid = MsgId} = Data,
     Alg = dns:dname_to_lower(AlgM),
     KeyName = dns:dname_to_lower(KeyNameM),
+    QName = dns:dname_to_lower(QNameM),
     Reply = ReqMsg#dns_message{qr = true, rc = ?DNS_RCODE_NOTAUTH,
 			       anc = 0, answers = [],
 			       auc = 0, authority = [],
 			       adc = 0, additional = []},
     LogProps = [{op, OC}, {rc, ?DNS_RCODE_NOTAUTH}, {keyname, KeyName}],
-    case dnsxd:get_key(KeyName) of
-	{ZoneName, #dnsxd_tsig_key{secret = Secret}} ->
-	    LogPropsZone = [{zone, ZoneName}|LogProps],
+    LogProps0 = case OC =:= ?DNS_OPCODE_UPDATE of
+		    true -> [{zone, QName}|LogProps];
+		    false -> LogProps
+		end,
+    Q0 = Q#dns_query{name = QName},
+    Datastore = dnsxd:datastore(),
+    case Datastore:dnsxd_get_tsig_key(OC, Q0, KeyName, Alg) of
+	#dnsxd_tsig_key{secret = Secret} ->
 	    case dns:verify_tsig(ReqMsgBin, KeyName, Secret) of
 		{ok, MAC} when is_binary(MAC) ->
-		    TSIGCtx = #dnsxd_tsig_ctx{zonename = ZoneName,
-					      keyname = KeyName,
+		    TSIGCtx = #dnsxd_tsig_ctx{keyname = KeyName,
 					      alg = Alg,
 					      secret = Secret,
 					      mac = MAC,
@@ -139,22 +146,16 @@ verify_tsig(MsgCtx, #dns_message{oc = OC} = ReqMsg,
 					   ?DNS_TSIGERR_BADTIME,
 					   [{other, <<(dns:unix_time()):32>>}]),
 		    dnsxd:log(MsgCtx, [{tsig_err, ?DNS_TSIGERR_BADTIME}
-				       |LogPropsZone]),
+				       |LogProps0]),
 		    dnsxd_op_ctx:to_wire(MsgCtx, RespMsg);
 		{error, TSIGRC} ->
 		    RespMsg = dns:add_tsig(Reply, Alg, <<>>, <<>>, TSIGRC),
-		    dnsxd:log(MsgCtx, [{tsig_err, TSIGRC}|LogPropsZone]),
+		    dnsxd:log(MsgCtx, [{tsig_err, TSIGRC}|LogProps0]),
 		    dnsxd_op_ctx:to_wire(MsgCtx, RespMsg)
 	    end;
 	undefined ->
-	    case dnsxd_ds_server:find_zone(KeyName) of
-		undefined -> ok;
-		ZoneRef ->
-		    ZoneName = dnsxd_ds_server:zonename_from_ref(ZoneRef),
-		    LogProps0 = [{zone, ZoneName},
-				 {tsig_err, ?DNS_TSIGERR_BADKEY}|LogProps],
-		    dnsxd:log(MsgCtx, LogProps0)
-	    end,
+	    LogProps1 = [{tsig_err, ?DNS_TSIGERR_BADKEY}|LogProps0],
+	    dnsxd:log(MsgCtx, LogProps1),
 	    RespMsg = dns:add_tsig(Reply, Alg, <<>>, <<>>, ?DNS_TSIGERR_BADKEY),
 	    dnsxd_op_ctx:to_wire(MsgCtx, RespMsg)
     end.

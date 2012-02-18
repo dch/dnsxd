@@ -26,7 +26,7 @@
 
 -export([dnsxd_admin_zone_list/0, dnsxd_admin_get_zone/1,
 	 dnsxd_admin_change_zone/2, dnsxd_dns_update/5,
-	 dnsxd_reload_zones/1, dnsxd_allow_axfr/2]).
+	 dnsxd_reload_zones/1, dnsxd_allow_axfr/2, dnsxd_get_tsig_key/4]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -35,10 +35,14 @@
 -define(SERVER, ?MODULE).
 
 -define(TAB_AXFR, dnsxd_couch_axfr).
+-define(TAB_TSIG, dnsxd_couch_tsig).
 
 -define(CHANGES_FILTER, <<?DNSXD_COUCH_DESIGNDOC "/dnsxd_couch_zone">>).
 
 -record(state, {db_ref, db_seq, db_lost = false, reload = []}).
+-record(tsig_entry, {zone :: binary(),
+		     name :: binary(),
+		     key}).
 
 %%%===================================================================
 %%% API
@@ -52,9 +56,12 @@ start_link() ->
 
 dnsxd_dns_update(MsgCtx, ZoneName, Lease, PreReq, Changes) ->
     case dnsxd_op_ctx:tsig(MsgCtx) of
-	#dnsxd_tsig_ctx{zonename = ZoneName, keyname = KeyName} ->
-	    {ZoneName, Key} = dnsxd:get_key(KeyName),
-	    update_zone(Key, ZoneName, Lease, PreReq, Changes);
+	#dnsxd_tsig_ctx{keyname = KeyName} ->
+	    case get_tsig_key(ZoneName, KeyName) of
+		undefined -> {error, ?DNS_RCODE_REFUSED};
+		Key ->
+		    update_zone(Key, ZoneName, Lease, PreReq, Changes)
+	    end;
 	_ -> {error, ?DNS_RCODE_NOTAUTH}
     end.
 
@@ -105,12 +112,19 @@ dnsxd_allow_axfr(Context, ZoneName) ->
 	    lists:member(SrcIP, IPs)
     end.
 
+dnsxd_get_tsig_key(?DNS_OPCODE_UPDATE,
+		   #dns_query{name = Zone, type = ?DNS_TYPE_SOA}, Name, _Alg) ->
+    get_tsig_key(Zone, Name);
+dnsxd_get_tsig_key(_OpCode, _Query, _Name, _Alg) -> undefined.
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
 init([]) ->
     ?TAB_AXFR = ets:new(?TAB_AXFR, [named_table, {keypos, 1}]),
+    ?TAB_TSIG = ets:new(?TAB_TSIG, [named_table, {keypos, #tsig_entry.zone},
+				    bag]),
     {ok, DbRef, DbSeq} = dnsxd_couch_lib:setup_monitor(?CHANGES_FILTER),
     State = #state{db_ref = DbRef, db_seq = DbSeq},
     ok = init_load_zones(),
@@ -188,7 +202,8 @@ load_zone(ZoneName) ->
 	{ok, #dnsxd_couch_zone{enabled = true} = CouchZone} ->
 	    Zone = to_dnsxd_zone(CouchZone),
 	    ok = dnsxd:reload_zone(Zone),
-	    ok = cache_axfr(CouchZone);
+	    ok = cache_axfr(CouchZone),
+	    ok = cache_tsig(CouchZone);
 	{ok, #dnsxd_couch_zone{enabled = false}} ->
 	    ok = unload_zone(ZoneName),
 	    {error, disabled};
@@ -210,13 +225,31 @@ cache_axfr(#dnsxd_couch_zone{name = Zone, axfr_hosts = Hosts}) ->
     ets:insert(?TAB_AXFR, {Zone, Hosts}),
     ok.
 
+cache_tsig(#dnsxd_couch_zone{name = Zone, tsig_keys = TSIGKeys}) ->
+    New = [#tsig_entry{zone = Zone,
+		       name = <<Name/binary, $., Zone/binary>>,
+		       key = couch_tk_to_dnsxd_key(TK)}
+	   || #dnsxd_couch_tk{name = Name} = TK <- TSIGKeys ],
+    Old = ets:lookup(?TAB_TSIG, Zone),
+    [ ets:delete_object(?TAB_TSIG, Key) || Key <- Old -- New],
+    true = ets:insert(?TAB_TSIG, New),
+    ok.
+
 unload_zone(ZoneName) ->
     ok = dnsxd:delete_zone(ZoneName),
     true = ets:delete(?TAB_AXFR, ZoneName),
+    true = ets:match_delete(?TAB_TSIG, #tsig_entry{zone = ZoneName, _ = '_'}),
     ok.
 
-update_zone(#dnsxd_tsig_key{dnssd_only = true, name = KeyName},
-	    ZoneName, Lease, PreReq, Changes) ->
+get_tsig_key(Zone, Name) ->
+    Pattern = #tsig_entry{zone = Zone, name = Name, key = '$1'},
+    case ets:match(?TAB_TSIG, Pattern) of
+	[[#dnsxd_tsig_key{} = Key]] -> Key;
+	_ -> undefined
+    end.
+
+update_zone(#dnsxd_tsig_key{dnssd_only = true, name = KeyName}, ZoneName, Lease,
+	    PreReq, Changes) ->
     Fun = fun(Change) ->
 		  dnsxd_lib:is_dnssd_change(ZoneName, KeyName, Change)
 	  end,

@@ -13,7 +13,7 @@
 
 -record(dnsxd_if_spec, {ip, port, protocol}).
 
--record(dnsxd_tsig_ctx, {zonename, keyname, alg, secret, mac, msgid}).
+-record(dnsxd_tsig_ctx, {keyname, alg, secret, mac, msgid}).
 
 -record(dnsxd_zone, {name,
 		     enabled = false,

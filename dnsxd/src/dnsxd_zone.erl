@@ -46,18 +46,14 @@ receive_result(Pid, Ref) ->
 	{'EXIT', Pid, Reason} -> {error, Reason}
     end.
 
-main(Parent, TempTab, Ref, #dnsxd_zone{name = ZoneName} = Zone) ->
+main(Parent, TempTab, Ref, #dnsxd_zone{} = Zone) ->
     WorkerLimit = worker_limit(),
-    Funs = [ fun prep_tsigkey/1,
-	     fun prep_rr/1,
+    Funs = [ fun prep_rr/1,
 	     fun prep_nsec3param/1,
 	     fun prep_dnsseckey/1,
 	     fun prep_serials/1 ],
     Zone0 = lists:foldl(fun(Fun, #dnsxd_zone{} = T) -> Fun(T) end, Zone, Funs),
-    #dnsxd_zone{soa_param = SOA, nsec3 = NSEC3, tsig_keys = TSIGKeys} = Zone0,
-    ZoneRef = #zone_ref{name = ZoneName, ref = Ref},
-    TSIG = #tsig{zone_ref = ZoneRef, keys = TSIGKeys},
-    ets:insert(TempTab, TSIG),
+    #dnsxd_zone{soa_param = SOA, nsec3 = NSEC3} = Zone0,
     Serials = get_serials_to_prep(Zone0),
     ok = main(TempTab, [], WorkerLimit, Serials, Ref, Zone0),
     RealSerials = lists:reverse(tl(lists:reverse(Serials))),
@@ -97,10 +93,6 @@ worker_limit() ->
 	    application:set_env(dnsxd, insert_workers, Limit1),
 	    Limit1
     end.
-
-prep_tsigkey(#dnsxd_zone{tsig_keys = Keys} = Zone) ->
-    NewKeys = [Key || #dnsxd_tsig_key{enabled = true} = Key <- Keys ],
-    Zone#dnsxd_zone{tsig_keys = NewKeys}.
 
 prep_rr(#dnsxd_zone{rr = RRs} = Zone) ->
     NewRRs = [ RR#dnsxd_rr{name = dns:dname_to_lower(Name)}

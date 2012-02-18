@@ -52,7 +52,7 @@
 
 %% querying
 -export([find_zone/1, is_dnssec_zone/1, lookup_rrname/2,
-	 is_cut/2, lookup_sets/4, get_set/3, get_all_sets/1, get_key/1,
+	 is_cut/2, lookup_sets/4, get_set/3, get_all_sets/1,
 	 zonename_from_ref/1, get_nsec3_cover/2, get_zone/1, next_serial/1]).
 
 %%%===================================================================
@@ -93,35 +93,6 @@ is_dnssec_zone(#serial_ref{zone_ref = Ref}) -> is_dnssec_zone(Ref);
 is_dnssec_zone(#zone_ref{name = Name}) ->
     Labels = dns:dname_to_labels(Name),
     undefined =/= ets:lookup_element(?TAB_ZONE, Labels, #zone.nsec3).
-
-get_key(FQKeyName) ->
-    case fqkn_to_key_and_zonename(FQKeyName) of
-	undefined -> undefined;
-	{KeyName, ZoneName} ->
-	    ZoneNameLabels = dns:dname_to_labels(ZoneName),
-	    case ets:lookup(?TAB_ZONE, ZoneNameLabels) of
-		[#zone{name = ZoneName, ref = Ref}] ->
-		    ZoneRef = #zone_ref{name = ZoneName, ref = Ref},
-		    Keys = ets:lookup_element(?TAB_TSIG, ZoneRef, #tsig.keys),
-		    case lists:keyfind(KeyName, #dnsxd_tsig_key.name, Keys) of
-			#dnsxd_tsig_key{} = Key -> {ZoneName, Key};
-			false -> undefined
-		    end;
-		[#zone{name = undefined}] -> undefined;
-		[] -> undefined
-	    end
-    end.
-
-fqkn_to_key_and_zonename(FQKeyName) ->
-    fqkn_to_key_and_zonename(<<>>, FQKeyName).
-
-fqkn_to_key_and_zonename(KeyName, <<$., ZoneName/binary>>) ->
-    {KeyName, ZoneName};
-fqkn_to_key_and_zonename(KeyName, <<"\\.", Rest/binary>>) ->
-    fqkn_to_key_and_zonename(<<KeyName/binary, "\\.">>, Rest);
-fqkn_to_key_and_zonename(KeyName, <<C, Rest/binary>>) ->
-    fqkn_to_key_and_zonename(<<KeyName/binary, C>>, Rest);
-fqkn_to_key_and_zonename(_, _) -> undefined.
 
 lookup_rrname(#serial_ref{zone_ref = #zone_ref{name = ZoneName}} = Ref, Name) ->
     Tree = ets:lookup_element(?TAB_RRMAP, Ref, #rrmap.tree),
@@ -553,5 +524,4 @@ get_serial_ref(ZoneRef, _Now, [Serial]) ->
 tab(#rrmap{}) -> ?TAB_RRMAP;
 tab(#rrname{}) -> ?TAB_RRNAME;
 tab(#rrset{}) -> ?TAB_RRSET;
-tab(#tsig{}) -> ?TAB_TSIG;
 tab(#zone{}) -> ?TAB_ZONE.

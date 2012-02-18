@@ -49,7 +49,6 @@
 		data = [] :: [tuple()],
 		sig = [] :: [tuple()],
 		add_dnames = [] :: [binary()]}).
--record(tsig, {zone_ref :: #zone_ref{}, keys = [] :: [tuple()]}).
 -record(zone, {labels :: [binary()],
 	       name :: binary(),
 	       soa = undefined :: 'undefined' | tuple(),

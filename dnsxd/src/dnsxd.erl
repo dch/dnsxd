@@ -37,7 +37,7 @@
 -export([load_zone/1, reload_zone/1, delete_zone/1, zone_loaded/1]).
 
 %% querying
--export([get_zone/1, get_key/1]).
+-export([get_zone/1]).
 
 %% llq
 -export([new_llq/3, msg_llq/2]).
@@ -133,8 +133,6 @@ load_zone(Zone) -> dnsxd_ds_server:load_zone(Zone).
 reload_zone(Zone) -> dnsxd_ds_server:reload_zone(Zone).
 
 delete_zone(ZoneName) -> dnsxd_ds_server:delete_zone(ZoneName).
-
-get_key(KeyName) -> dnsxd_ds_server:get_key(KeyName).
 
 new_llq(Pid, MsgCtx, Msg) -> dnsxd_llq_manager:new_llq(Pid, MsgCtx, Msg).
 
