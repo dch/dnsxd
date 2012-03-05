@@ -19,7 +19,7 @@ rr(Config) ->
 		    data = #dns_rrdata_txt{
 		      txt = [<<"this is not a wildcard">>]}},
 	  #dnsxd_rr{name = <<"host1.example">>,
-		    data = #dns_rrdata_a{ip = <<"192.0.2.1">>}},
+		    data = #dns_rrdata_a{ip = {192,0,2,1}}},
 	  #dnsxd_rr{name = <<"_ssh._tcp.host1.example">>,
 		    data = #dns_rrdata_srv{priority = 0,
 					   weight = 0,
