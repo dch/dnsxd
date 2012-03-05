@@ -478,14 +478,13 @@ gen_nsec3(#dnsxd_zone{name = ZoneName,
 		      true ->
 			  DName = dns:encode_dname(Name),
 			  HashedDN = dnssec:ih(HashAlgNo, Salt, DName, Iter),
-			  HashedDNHex = dnssec:base32hex_encode(HashedDN),
-			  NewName = <<HashedDNHex/binary, $.,
-				      ZoneName/binary>>,
+			  Label = base32:encode(HashedDN, [hex,nopad,lower]),
+			  NewName = <<Label/binary, $., ZoneName/binary>>,
 			  Data = #dns_rrdata_nsec3{hash_alg = 1,
 						   opt_out = OptOut,
 						   iterations = Iter,
 						   salt = Salt,
-						   hash = HashedDNHex,
+						   hash = HashedDN,
 						   types = Types0},
 			  RR = #dnsxd_rr{name = NewName,
 					 incept = Serial,
@@ -497,7 +496,7 @@ gen_nsec3(#dnsxd_zone{name = ZoneName,
 			  NSEC3 = #nsec3{name = Name,
 					 hash = HashedDN,
 					 hashdn = NewName},
-			   [{HashedDN, NSEC3, RR}|Acc];
+			  [{HashedDN, NSEC3, RR}|Acc];
 		      false -> Acc
 		  end
 	  end,
