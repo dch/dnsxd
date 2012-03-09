@@ -800,6 +800,24 @@ decode(List) when is_list(List) ->
 
 decode(dnsxd_couch_zone, name, List) -> get_value(<<"_id">>, List);
 decode(dnsxd_couch_zone, rev, List) -> get_value(<<"_rev">>, List);
+decode(dnsxd_couch_rr, data, List) ->
+    Fun = fun({V}) when is_list(V) ->
+		  {proplists:get_value(?DNSXD_COUCH_TAG, V), V};
+	     (Term) -> Term end,
+    Data = case get_value(<<"data">>, List) of
+	       {DataTmp} -> DataTmp;
+	       DataTmp -> DataTmp
+	   end,
+    try dns_record:deserialise(Data, [{wrap_fun, Fun}])
+    catch
+	_:_ when is_binary(Data) -> base64:decode(Data);
+	_:_ when is_list(Data) -> decode(Data);
+	_:_ -> throw({wtf, Data})
+    end;
+decode(Tag, ip, List)
+  when Tag =:= dns_rrdata_a orelse Tag =:= dns_rrdata_aaaa ->
+    {ok, IP} = inet_parse:address(binary_to_list(get_value(<<"ip">>, List))),
+    IP;
 decode(Tag, Field, List) ->
     Default = get_default(Tag, Field),
     case get_value(atom_to_binary(Field, latin1), List, Default) of
@@ -872,10 +890,13 @@ encode_zipper(dnsxd_couch_zone, tsig_keys, Keys) ->
 encode_zipper(dnsxd_couch_zone, dnssec_keys, Keys) ->
     {<<"dnssec_keys">>, [ encode(Key) || Key <- Keys ]};
 encode_zipper(dnsxd_couch_dk, data, Key) -> {<<"data">>, encode(Key)};
-encode_zipper(dnsxd_couch_rr, data, Bin) when is_binary(Bin) ->
-    {<<"data">>, base64:encode(Bin)};
-encode_zipper(dnsxd_couch_rr, data, Data) when is_tuple(Data) ->
-    {<<"data">>, encode(Data)};
+encode_zipper(dnsxd_couch_rr, data, Data) ->
+    Fun = fun({K,V}) -> {[{?DNSXD_COUCH_TAG, K}|V]};
+	     (Bin) when is_binary(Bin) -> Bin end,
+    {<<"data">>, dns_record:serialise(Data, [{wrap_fun, Fun}])};
+encode_zipper(Tag, ip, IP)
+  when Tag =:= dns_rrdata_a orelse Tag =:= dns_rrdata_aaaa ->
+    {<<"ip">>, list_to_binary(inet_parse:ntoa(IP))};
 encode_zipper(_Tag, Key, undefined) -> {atom_to_binary(Key, latin1), null};
 encode_zipper(_Tag, Key, Value) -> {atom_to_binary(Key, latin1), Value}.
 
@@ -889,7 +910,7 @@ get_value(Key, List, Default) ->
 
 -ifdef(TEST).
 
-encodecode_test_() ->
+encode_decode_test_() ->
     Zone1 = #dnsxd_couch_zone{},
     Zone2 = #dnsxd_couch_zone{rev = <<$a>>},
     Zone3 = #dnsxd_couch_zone{meta = {[]}},
@@ -899,7 +920,7 @@ encodecode_test_() ->
 			  type = 97, ttl = $a, data = <<$a>>},
 	  #dnsxd_couch_rr{id = <<$b>>, incept = $b, name = <<$b>>,
 			  class = ?DNS_CLASS_IN, type = ?DNS_TYPE_A, ttl = $b,
-			  data = #dns_rrdata_a{ip = <<"127.0.0.1">>}}],
+			  data = #dns_rrdata_a{ip = {127,0,0,1}}}],
     Zone5 = #dnsxd_couch_zone{rr = RR},
     TK = #dnsxd_couch_tk{name = <<$t>>, secret = <<$s>>},
     Zone6 = #dnsxd_couch_zone{tsig_keys = [TK]},
