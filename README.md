@@ -2,7 +2,13 @@
 
 **License: Apache 2**
 
-**Status: Alpha**
+**Status: Abandoned**
+
+I'm no longer working on dnsxd. A subset of dnsxd's functionality will be
+added to [dns_erlang](https://github.com/andrewtj/dns_erlang) as I have the
+time and inclination.
+
+This repository will be removed in about one month (mid-July).
 
 ### Overview
 
